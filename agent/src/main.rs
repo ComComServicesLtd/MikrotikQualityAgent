@@ -53,6 +53,8 @@ fn main() -> ExitCode {
         cli::Command::Reflect(args) => standalone(cli::run_reflect(args)),
         cli::Command::Probe(args) => standalone(cli::run_probe(*args)),
         cli::Command::Discover(args) => standalone(cli::run_discover(*args)),
+        cli::Command::Trace(args) => standalone(cli::run_trace(*args)),
+        cli::Command::Scan(args) => standalone(cli::run_scan(*args)),
         cli::Command::Agent => run_managed(),
     }
 }

@@ -172,6 +172,12 @@ fn parse_arp(v: &Value) -> Vec<ArpEntry> {
         .collect()
 }
 
+/// Public wrapper so one-shot tools can reuse lease parsing without the whole
+/// collection pass.
+pub fn parse_leases_public(v: &Value) -> Vec<DhcpLease> {
+    parse_leases(v)
+}
+
 fn parse_leases(v: &Value) -> Vec<DhcpLease> {
     rows(v)
         .map(|r| {

@@ -113,6 +113,20 @@ Both RouterOS wireless stacks are handled: the hAP ac³ answers on legacy
 `/interface/wireless`, the hAP ax³ returns 400 for it and answers on
 `/interface/wifi`. One build covers a mixed fleet.
 
+Two active diagnostics run from the router as well:
+
+```bash
+mqagent trace --host 172.16.220.1 --user claude --target 1.1.1.1
+mqagent scan  --host 172.16.220.1 --user claude --range 192.168.88.0/24
+```
+
+`trace` reports **where** the path degrades rather than listing hops. It
+deliberately ignores loss and latency at an intermediate hop that does not
+persist to the destination — that is a router rate-limiting ICMP to its own
+control plane while forwarding perfectly, and it is the single most misread
+thing in a traceroute. It also surfaces routing loops and carrier-grade NAT,
+which explains why port forwarding cannot work no matter how it is configured.
+
 ### Tests
 
 ```bash
@@ -138,7 +152,8 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Offline result spool | Implemented, tested |
 | Network discovery (wifi, ARP, DHCP, storms) | Implemented, verified against a live router |
 | RouterOS bandwidth-test offload | Not yet |
-| Discovery: traceroute, ip-scan, pcap collectors | Not yet — API verified, not wired |
+| Discovery: traceroute + ip-scan | Implemented, verified against a live router |
+| Discovery: pcap / broadcast-source attribution | Not yet — storms detected by counters only |
 | Operator API (groups, tokens, one-off tests) | Not yet — currently raw SQL |
 | TWAMP-Light interop | Not yet |
 

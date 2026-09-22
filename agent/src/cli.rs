@@ -32,6 +32,8 @@ USAGE:
     mqagent reflect [OPTIONS]      Standalone reflector, no controller needed
     mqagent probe   [OPTIONS]      Standalone sender, no controller needed
     mqagent discover [OPTIONS]     Survey the local network via a RouterOS device
+    mqagent trace    [OPTIONS]     Traceroute from a RouterOS device, with analysis
+    mqagent scan     [OPTIONS]     IP-scan a range from a RouterOS device
     mqagent --help
 
 REFLECT OPTIONS:
@@ -61,8 +63,19 @@ DISCOVER OPTIONS:
 EXAMPLE — measure the path to a router running `mqagent reflect`:
     mqagent probe --peer 172.16.220.138 --session cafe --count 300 --dscp 46
 
+TRACE OPTIONS:   (plus the RouterOS options above)
+    --target <IP>        Where to trace to                     [required]
+    --count <N>          Probes per hop                        [default: 3]
+
+SCAN OPTIONS:    (plus the RouterOS options above)
+    --range <CIDR|RANGE> What to scan, e.g. 192.168.88.0/24    [required]
+    --duration <S>       How long to scan                      [default: 10]
+
 EXAMPLE — find out why a site is slow:
     mqagent discover --host 172.16.220.1 --user claude
+
+EXAMPLE — find where the latency is introduced:
+    mqagent trace --host 172.16.220.1 --user claude --target 1.1.1.1
 ";
 
 #[derive(Debug, PartialEq)]
@@ -72,6 +85,23 @@ pub enum Command {
     Reflect(ReflectArgs),
     Probe(Box<ProbeArgs>),
     Discover(Box<DiscoverArgs>),
+    Trace(Box<TraceArgs>),
+    Scan(Box<ScanArgs>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TraceArgs {
+    pub ros: DiscoverArgs,
+    pub target: String,
+    pub count: u32,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ScanArgs {
+    pub ros: DiscoverArgs,
+    /// Address range or CIDR, e.g. `192.168.88.0/24`.
+    pub range: String,
+    pub duration_s: u32,
 }
 
 #[derive(Debug, PartialEq)]
@@ -251,6 +281,22 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 json: flags.iter().any(|f| f == "json"),
             })))
         }
+        "trace" => {
+            let ros = ros_args(&get, &flags)?;
+            Ok(Command::Trace(Box::new(TraceArgs {
+                target: get("target").ok_or("trace requires --target")?.to_string(),
+                count: num(get("count"), 3, "count")?,
+                ros,
+            })))
+        }
+        "scan" => {
+            let ros = ros_args(&get, &flags)?;
+            Ok(Command::Scan(Box::new(ScanArgs {
+                range: get("range").ok_or("scan requires --range")?.to_string(),
+                duration_s: num(get("duration"), 10, "duration")?,
+                ros,
+            })))
+        }
         "discover" => {
             let tls = flags.iter().any(|f| f == "tls");
             Ok(Command::Discover(Box::new(DiscoverArgs {
@@ -266,6 +312,22 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
         }
         other => Err(format!("unknown command {other:?} — try --help")),
     }
+}
+
+/// Shared RouterOS connection options, used by discover, trace and scan.
+fn ros_args<'a, F>(get: &F, flags: &[String]) -> Result<DiscoverArgs, String>
+where
+    F: Fn(&str) -> Option<&'a str>,
+{
+    let tls = flags.iter().any(|f| f == "tls");
+    Ok(DiscoverArgs {
+        host: get("host").ok_or("--host is required")?.to_string(),
+        port: num(get("port"), if tls { 443 } else { 80 }, "port")?,
+        user: get("user").unwrap_or("admin").to_string(),
+        pass: get("pass").unwrap_or("").to_string(),
+        tls,
+        json: flags.iter().any(|f| f == "json"),
+    })
 }
 
 fn num<T: std::str::FromStr>(v: Option<&str>, default: T, name: &str) -> Result<T, String> {
@@ -705,4 +767,157 @@ pub async fn run_discover(args: DiscoverArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Connect to a RouterOS device using the shared options.
+fn connect(a: &DiscoverArgs) -> anyhow::Result<crate::routeros::RouterOs> {
+    Ok(crate::routeros::RouterOs::new(
+        &a.host,
+        a.port,
+        &a.user,
+        &a.pass,
+        a.tls,
+        // Generous: a traceroute across a slow path, or a scan of a /24, takes
+        // a while and the router streams results for the whole duration.
+        Duration::from_secs(180),
+    )?)
+}
+
+/// Traceroute from the router, then explain where the path degrades.
+pub async fn run_trace(args: TraceArgs) -> anyhow::Result<()> {
+    use crate::discovery::tools;
+
+    let ros = connect(&args.ros)?;
+    let identity = ros.check().await?;
+    if !args.ros.json {
+        eprintln!("tracing {} from {} ({})", args.target, identity, args.ros.host);
+    }
+
+    let raw = ros
+        .post(
+            "/tool/traceroute",
+            &serde_json::json!({
+                "address": args.target,
+                "count": args.count.to_string(),
+                "timeout": "1",
+            }),
+        )
+        .await?;
+    let hops = tools::parse_traceroute(&raw);
+    let found = tools::analyse_path(&hops, &args.target);
+
+    if args.ros.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "router": identity,
+                "target": args.target,
+                "hops": hops.iter().map(|h| serde_json::json!({
+                    "ttl": h.ttl, "address": h.address, "sent": h.sent,
+                    "loss_pct": h.loss_pct, "avg_ms": h.avg_ms,
+                    "best_ms": h.best_ms, "worst_ms": h.worst_ms,
+                })).collect::<Vec<_>>(),
+                "findings": found,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!();
+    for h in &hops {
+        if h.responded() {
+            println!(
+                "  {:>2}  {:<16} {:>7.1} ms  (best {:.1}, worst {:.1})  {:.0}% loss",
+                h.ttl, h.address, h.avg_ms, h.best_ms, h.worst_ms, h.loss_pct
+            );
+        } else {
+            println!("  {:>2}  {:<16} no response", h.ttl, "*");
+        }
+    }
+    print_findings(&found);
+    Ok(())
+}
+
+/// Scan a range from the router and compare it with what DHCP knows.
+pub async fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
+    use crate::discovery::{collect, tools};
+
+    let ros = connect(&args.ros)?;
+    let identity = ros.check().await?;
+    if !args.ros.json {
+        eprintln!(
+            "scanning {} from {} ({}) for {}s",
+            args.range, identity, args.ros.host, args.duration_s
+        );
+    }
+
+    let raw = ros
+        .post(
+            "/tool/ip-scan",
+            &serde_json::json!({
+                "address-range": args.range,
+                "duration": args.duration_s.to_string(),
+            }),
+        )
+        .await?;
+    let hosts = tools::parse_ip_scan(&raw);
+
+    // Lease data turns a bare host list into "which of these should be here".
+    let leases = match ros.get("/ip/dhcp-server/lease").await {
+        Ok(v) => collect::parse_leases_public(&v),
+        Err(_) => vec![],
+    };
+    let found = tools::analyse_scan(&hosts, &leases);
+
+    if args.ros.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "router": identity,
+                "range": args.range,
+                "hosts": hosts.iter().map(|h| serde_json::json!({
+                    "address": h.address, "mac": h.mac,
+                    "dns": h.dns, "netbios": h.netbios,
+                })).collect::<Vec<_>>(),
+                "findings": found,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("\n{} host(s) responding", hosts.len());
+    for h in &hosts {
+        let label = if !h.dns.is_empty() {
+            h.dns.clone()
+        } else if !h.netbios.is_empty() {
+            h.netbios.clone()
+        } else {
+            String::new()
+        };
+        println!("  {:<16} {:<18} {}", h.address, if h.mac.is_empty() { "-" } else { &h.mac }, label);
+    }
+    print_findings(&found);
+    Ok(())
+}
+
+fn print_findings(found: &[crate::discovery::findings::Finding]) {
+    use crate::discovery::findings::Severity;
+    println!();
+    if found.is_empty() {
+        println!("No problems found.");
+        return;
+    }
+    println!("Findings ({})", found.len());
+    for f in found {
+        let tag = match f.severity {
+            Severity::Critical => "CRITICAL",
+            Severity::Warning => "WARNING ",
+            Severity::Info => "INFO    ",
+        };
+        println!("\n  [{tag}] {}", f.code);
+        println!("  {}", f.summary);
+        for e in &f.evidence {
+            println!("    · {e}");
+        }
+    }
 }
