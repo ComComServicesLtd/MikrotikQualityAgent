@@ -1,7 +1,9 @@
 //! Wire protocols spoken by the probe data plane.
 //!
-//! [`mqp`] is the native format (see `docs/protocol.md`); `twamp` will add
-//! RFC 5357 unauthenticated mode for interop with MikroTik's own TWAMP
-//! reflector and third-party gear.
+//! [`mqp`] is the native format (see `docs/protocol.md`). [`twamp`] implements
+//! RFC 5357 unauthenticated mode for interop with carrier responders and test
+//! sets — and so that a MikroTik can answer TWAMP at all, since RouterOS 7.x
+//! provides no TWAMP menu and no package supplies one.
 
 pub mod mqp;
+pub mod twamp;

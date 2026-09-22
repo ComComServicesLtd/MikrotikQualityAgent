@@ -34,6 +34,8 @@ USAGE:
     mqagent discover [OPTIONS]     Survey the local network via a RouterOS device
     mqagent trace    [OPTIONS]     Traceroute from a RouterOS device, with analysis
     mqagent scan     [OPTIONS]     IP-scan a range from a RouterOS device
+    mqagent twamp-reflect [OPTIONS]  TWAMP-Light responder (RouterOS has none)
+    mqagent twamp-probe   [OPTIONS]  Measure against any TWAMP-Light responder
     mqagent --help
 
 REFLECT OPTIONS:
@@ -74,8 +76,26 @@ SCAN OPTIONS:    (plus the RouterOS options above)
 EXAMPLE — find out why a site is slow:
     mqagent discover --host 172.16.220.1 --user claude
 
+TWAMP-REFLECT OPTIONS:
+    --port <PORT>        Listen port (862 is the registered one)  [default: 862]
+    --peer <IP>          Permit this source; repeatable. Omit to answer anyone,
+                         which is safe only behind a restrictive firewall.
+
+TWAMP-PROBE OPTIONS:
+    --peer <IP[:PORT]>   Responder to measure                     [required]
+    --count <N>          Packets to send                          [default: 100]
+    --interval <MS>      Gap between packets                      [default: 20]
+    --size <BYTES>       Total packet size, 14..1400              [default: 41]
+    --dscp <0-63>        DSCP to mark
+    --timeout <MS>       Per-packet reply timeout                 [default: 1000]
+    --codec <NAME>       Codec for MOS scoring                    [default: g711]
+    --json               Emit JSON instead of a report
+
 EXAMPLE — find where the latency is introduced:
     mqagent trace --host 172.16.220.1 --user claude --target 1.1.1.1
+
+EXAMPLE — let a MikroTik answer TWAMP, which RouterOS cannot do itself:
+    mqagent twamp-reflect --port 862 --peer 203.0.113.7
 ";
 
 #[derive(Debug, PartialEq)]
@@ -87,6 +107,28 @@ pub enum Command {
     Discover(Box<DiscoverArgs>),
     Trace(Box<TraceArgs>),
     Scan(Box<ScanArgs>),
+    TwampReflect(TwampReflectArgs),
+    TwampProbe(Box<TwampProbeArgs>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TwampReflectArgs {
+    pub port: u16,
+    /// Sources permitted to be answered. Empty means answer anyone, which is
+    /// only appropriate behind a firewall that already restricts the port.
+    pub peers: Vec<std::net::IpAddr>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TwampProbeArgs {
+    pub peer: SocketAddr,
+    pub count: u32,
+    pub interval_ms: u64,
+    pub size: usize,
+    pub dscp: Option<u8>,
+    pub timeout_ms: u64,
+    pub codec: Codec,
+    pub json: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -208,7 +250,26 @@ where
                 ),
             })))
         }
-        other => Err(format!("MQ_MODE {other:?} is not one of: agent, reflect, probe")),
+        // RouterOS does not forward a container's cmd into argv, so every mode
+        // that might run on a router has to be reachable from the environment.
+        "twamp-reflect" => Ok(Command::TwampReflect(TwampReflectArgs {
+            port: num(get("MQ_TWAMP_PORT").as_deref(), 862, "MQ_TWAMP_PORT")?,
+            peers: match get("MQ_TWAMP_PEERS") {
+                Some(v) if !v.trim().is_empty() => v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        p.parse::<std::net::IpAddr>()
+                            .map_err(|_| format!("MQ_TWAMP_PEERS entry {p:?} is not an IP"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => vec![],
+            },
+        })),
+        other => Err(format!(
+            "MQ_MODE {other:?} is not one of: agent, reflect, probe, twamp-reflect"
+        )),
     })())
 }
 
@@ -275,6 +336,46 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 count: num(get("count"), 100, "count")?,
                 interval_ms: num(get("interval"), 20, "interval")?,
                 size: num(get("size"), DEFAULT_PACKET_LEN, "size")?,
+                dscp,
+                timeout_ms: num(get("timeout"), 1000, "timeout")?,
+                codec: codec(get("codec"))?,
+                json: flags.iter().any(|f| f == "json"),
+            })))
+        }
+        "twamp-reflect" => Ok(Command::TwampReflect(TwampReflectArgs {
+            port: num(get("port"), 862, "port")?,
+            peers: kv
+                .iter()
+                .filter(|(k, _)| k == "peer")
+                .map(|(_, v)| {
+                    v.parse::<std::net::IpAddr>()
+                        .map_err(|_| format!("--peer {v:?} is not an IP address"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        })),
+        "twamp-probe" => {
+            let peer = get("peer").ok_or("twamp-probe requires --peer")?;
+            let peer: SocketAddr = if peer.contains(':') {
+                peer.parse().map_err(|_| format!("--peer {peer:?} is not addr:port"))?
+            } else {
+                // 862 is the registered TWAMP port; a bare IP means that.
+                format!("{peer}:862").parse().map_err(|_| format!("--peer {peer:?} is not an IP"))?
+            };
+            let dscp = match get("dscp") {
+                Some(d) => {
+                    let v: u8 = d.parse().map_err(|_| format!("--dscp {d:?} is not a number"))?;
+                    if v > 63 {
+                        return Err(format!("--dscp {v} is out of range (0-63)"));
+                    }
+                    Some(v)
+                }
+                None => None,
+            };
+            Ok(Command::TwampProbe(Box::new(TwampProbeArgs {
+                peer,
+                count: num(get("count"), 100, "count")?,
+                interval_ms: num(get("interval"), 20, "interval")?,
+                size: num(get("size"), crate::proto::twamp::DEFAULT_PACKET_LEN, "size")?,
                 dscp,
                 timeout_ms: num(get("timeout"), 1000, "timeout")?,
                 codec: codec(get("codec"))?,
@@ -559,6 +660,41 @@ mod tests {
         // misconfiguration that only shows up as "no measurements".
         let err = from_env(env(&[("MQ_MODE", "reflct")])).unwrap().unwrap_err();
         assert!(err.contains("not one of"), "got {err}");
+    }
+
+    #[test]
+    fn env_can_select_the_twamp_responder() {
+        // The mode most likely to run on a router, since RouterOS has no TWAMP
+        // of its own — and argv is not delivered there.
+        let c = from_env(env(&[
+            ("MQ_MODE", "twamp-reflect"),
+            ("MQ_TWAMP_PORT", "862"),
+            ("MQ_TWAMP_PEERS", "203.0.113.7, 198.51.100.9"),
+        ]))
+        .unwrap()
+        .unwrap();
+        let Command::TwampReflect(r) = c else { panic!("expected twamp-reflect") };
+        assert_eq!(r.port, 862);
+        assert_eq!(r.peers.len(), 2);
+        assert_eq!(r.peers[0], "203.0.113.7".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn env_twamp_peers_may_be_omitted_for_an_open_responder() {
+        let c = from_env(env(&[("MQ_MODE", "twamp-reflect")])).unwrap().unwrap();
+        let Command::TwampReflect(r) = c else { panic!("expected twamp-reflect") };
+        assert!(r.peers.is_empty());
+        assert_eq!(r.port, 862, "the registered TWAMP port is the default");
+    }
+
+    #[test]
+    fn env_twamp_peers_rejects_a_bad_entry_rather_than_skipping_it() {
+        // Silently dropping a malformed peer would leave the responder
+        // answering fewer sources than configured, with no indication why.
+        let err = from_env(env(&[("MQ_MODE", "twamp-reflect"), ("MQ_TWAMP_PEERS", "10.0.0.1,nope")]))
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("nope"), "got {err}");
     }
 
     #[test]
@@ -920,4 +1056,96 @@ fn print_findings(found: &[crate::discovery::findings::Finding]) {
             println!("    · {e}");
         }
     }
+}
+
+/// Answer TWAMP-Light on behalf of a router that cannot.
+pub async fn run_twamp_reflect(args: TwampReflectArgs) -> anyhow::Result<()> {
+    use crate::probe::twamp::{AllowList, TwampReflector};
+
+    let mut allow = if args.peers.is_empty() { AllowList::open() } else { AllowList::new() };
+    for p in &args.peers {
+        allow.allow(*p);
+    }
+    let open = args.peers.is_empty();
+
+    let bind: SocketAddr = ([0, 0, 0, 0], args.port).into();
+    let reflector = TwampReflector::bind(bind, Arc::new(Mutex::new(allow)))
+        .await
+        .map_err(|e| anyhow::anyhow!("could not bind {bind}: {e}{}", port_hint(args.port)))?;
+
+    eprintln!("TWAMP-Light responder on {}", reflector.local_addr()?);
+    if open {
+        // TWAMP-Light has no session identifier, so an open responder answers
+        // whoever finds it. Saying so beats discovering it later.
+        eprintln!("WARNING: answering any source — restrict with --peer, or firewall the port");
+    } else {
+        eprintln!("answering: {}", args.peers.iter().map(|p| p.to_string())
+            .collect::<Vec<_>>().join(", "));
+    }
+    eprintln!("press Ctrl-C to stop");
+
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(reflector.run(rx));
+    tokio::signal::ctrl_c().await?;
+    let _ = tx.send(true);
+    let _ = task.await;
+    Ok(())
+}
+
+fn port_hint(port: u16) -> &'static str {
+    if port < 1024 {
+        " (ports below 1024 need elevated privileges)"
+    } else {
+        ""
+    }
+}
+
+/// Measure against any TWAMP-Light responder.
+pub async fn run_twamp_probe(args: TwampProbeArgs) -> anyhow::Result<()> {
+    use crate::probe::twamp::{self, TwampConfig};
+
+    let cfg = TwampConfig {
+        peer: args.peer,
+        count: args.count,
+        interval: Duration::from_millis(args.interval_ms),
+        payload_bytes: args.size,
+        dscp: args.dscp,
+        timeout: Duration::from_millis(args.timeout_ms),
+        linger: Duration::from_secs(2),
+    };
+
+    if !args.json {
+        eprintln!(
+            "TWAMP-Light to {} — {} packets, {} ms apart, {} bytes",
+            cfg.peer, cfg.count, args.interval_ms, cfg.payload_bytes
+        );
+    }
+
+    let run = twamp::run(&cfg).await?;
+    let m = stats::summarise(run.sent, &run.samples, args.dscp);
+    let score = m.rtt.zip(m.jitter).map(|(r, j)| {
+        mos::score(MosInput::new(r.avg_us, j.ipdv_avg_us, m.loss.loss_pct, args.codec))
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "protocol": "twamp-light",
+            "peer": cfg.peer.to_string(),
+            "metrics": m,
+            "mos": score,
+            "late_ticks": run.late_ticks,
+            "responder_claims_synchronised_clock": run.peer_claims_sync,
+        }))?);
+    } else {
+        print_report(&m, score.as_ref(), run.late_ticks);
+        if !run.peer_claims_sync {
+            println!("\nNote: the responder does not claim a synchronised clock, so one-way");
+            println!("      delay is not available. Round-trip figures are unaffected.");
+        }
+    }
+
+    if m.loss.received == 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }

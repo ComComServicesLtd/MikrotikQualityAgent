@@ -114,6 +114,21 @@ Voice     MOS 4.41  R-factor 93.2  (G711, 60 ms effective delay)
 `--json` emits the same data as machine-readable output. The process exits
 non-zero when nothing came back, so it drops into a monitoring script.
 
+### TWAMP-Light
+
+RouterOS provides no TWAMP responder, so the agent supplies one:
+
+```bash
+mqagent twamp-reflect --port 862 --peer 203.0.113.7
+mqagent twamp-probe   --peer 203.0.113.7
+```
+
+Useful for measuring toward carriers and transit providers that run a responder
+but will never host an agent. Note that TWAMP-Light has **no session
+identifier** — the source allow-list is the only admission control, so firewall
+the port. It also carries no DSCP echo, so QoS conformance is unavailable over
+TWAMP; that gap is why MQP exists.
+
 ### Network discovery
 
 The agent can survey a RouterOS device and explain what is wrong with the local
@@ -176,7 +191,7 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Operator API (groups, tokens, agents, membership, queries) | Implemented, tested |
 | Many-to-many group membership with roles | Implemented, verified with a shared upstream agent |
 | Dashboard (embedded + standalone) | Implemented, verified with live data |
-| TWAMP-Light interop | Not yet |
+| TWAMP-Light (responder + sender) | Implemented, verified on armv7 hardware |
 
 The measurement loop is complete: the scheduler plans a group's mesh, agents
 lease paired sender/reflector tasks, run them, and results land in TimescaleDB.

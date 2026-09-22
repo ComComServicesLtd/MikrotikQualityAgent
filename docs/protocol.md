@@ -142,21 +142,52 @@ sessions. The reflector never initiates anything.
 ## 5. TWAMP-Light mode
 
 When a task specifies `protocol: twamp-light`, the agent speaks RFC 5357
-unauthenticated mode instead, so it can measure against MikroTik's own TWAMP
-reflector or third-party gear.
+unauthenticated mode instead. This exists for interop: carriers and transit
+providers run responders, and test sets expect one.
 
-- **Session-Sender packet**: 14 bytes — `seq` (4), timestamp (8), error estimate
-  (2) — plus padding.
-- **Session-Reflector packet**: 41 bytes — reflector `seq`, its RX/TX
-  timestamps, sender's `seq` and timestamp, TTL.
-- Timestamps use **NTP 64-bit format** (seconds since 1900 + fraction), not the
-  nanosecond counter used by MQP.
+**RouterOS has no TWAMP of its own.** There is no `/tool/twamp` menu on
+RouterOS 7.x and no package supplies one — verified on 7.24.2. So where a
+MikroTik needs to answer TWAMP, this agent is what answers, and
+`mqagent twamp-reflect` is how.
 
-TWAMP-Light carries no `session_id` and no DSCP echo, so sessions are
-distinguished by UDP port alone and DSCP conformance is unavailable. MQP remains
-the default for agent-to-agent tests; TWAMP-Light exists for interop.
+| | Sender packet | Reflector packet |
+|---|---|---|
+| Minimum size | 14 bytes | 41 bytes |
+| Contents | seq, timestamp, error estimate | own seq + T3 + error, T2, sender's seq/T1/error, sender TTL |
 
----
+Both directions default to 41 bytes so neither is policed differently for its
+size.
+
+### Timestamps
+
+TWAMP uses **NTP 64-bit** format — seconds since 1900 plus a binary fraction —
+not the nanosecond counter MQP carries. The values are nevertheless derived
+from a *monotonic* source and converted at the boundary. Reading the system
+clock per packet would let an NTP step land mid-measurement and produce a
+large, plausible, wrong RTT.
+
+RTT is `(T4−T1) − (T3−T2)`, so as with MQP each bracket stays within one host's
+clock and **no synchronisation is required**. One-way delay would need it, and
+the agent does not claim it: the error estimate goes out with its synchronised
+bit clear, because an agent runs on a customer router whose NTP state we
+neither control nor verify.
+
+### What TWAMP-Light cannot do
+
+- **No session identifier.** MQP's admission control is an unguessable
+  `session_id`; Light mode has nothing equivalent, so the only filter available
+  is the source address. An open responder answers anyone who finds the port.
+  Replies are the same size as requests, so there is no amplification factor,
+  but keep the allow-list narrow and the firewall narrower.
+- **No DSCP echo.** There is no field for the class a packet arrived in, so
+  QoS conformance is unavailable — reported as missing rather than as zero.
+  Closing that gap is why MQP exists.
+- **No forward/reverse loss split beyond the reflector counter**, and that
+  counter is per-responder rather than per-session, since there are no
+  sessions.
+
+MQP therefore remains the default between our own agents. TWAMP-Light is for
+everything that is not one.
 
 ## 6. Version negotiation
 
