@@ -218,6 +218,33 @@ synchronise into a thundering herd — which would itself distort the measuremen
   to known peer addresses; the deployment guide covers the required rules.
 - The agent holds RouterOS credentials for its host. These should belong to a
   dedicated user restricted to the `test` policy, not `admin`.
+- An agent may submit results **only for tasks assigned to it**. Task ids are
+  deterministic and every agent learns its peers' UUIDs from the work it
+  leases, so without that check an agent could construct a peer's task id and
+  file measurements against it.
+
+### Agents live on premises you do not control
+
+Even where customers are never granted access to an agent device, the device is
+physically theirs to reach: a MikroTik has a reset button and a console port.
+"Not permitted" is a policy control, not a technical one, so the design assumes
+an agent may eventually be opened.
+
+What that yields, and what bounds it:
+
+| Extractable | Consequence |
+|---|---|
+| `identity.json` — the agent token | Can lease that agent's tasks and submit its results. Revoke with `DELETE /agents/{id}`. |
+| `/container/envs` — RouterOS credentials | Only reaches the router the holder already has. Keep the user scoped to the `test` policy and pinned to the container address. |
+| Leased tasks — peer names and addresses | **Bounded by group membership.** An agent only ever learns peers it is scheduled against: its own group, plus shared reflectors. It never learns another customer's agents, because they are never its peers. |
+
+That last row is the useful property of the group model: a compromised customer
+agent exposes that customer's own sites and the shared upstream addresses, not
+the rest of the fleet. Agent tokens are per-agent and individually revocable,
+so the blast radius is one device.
+
+The enrolment token in the envlist is inert after first registration — it is
+single-use and burned — but there is no reason to leave it there.
 
 ## Deployment shape during development
 

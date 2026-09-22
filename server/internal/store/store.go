@@ -395,11 +395,20 @@ func (s *Store) SaveResult(ctx context.Context, agentID uuid.UUID, group string,
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Scoped to the submitting agent, not just the task id.
+	//
+	// Task ids are deterministic (group, sender, reflector, cycle) and every
+	// agent learns its peers' UUIDs from the tasks it leases, so without this
+	// clause an agent could construct a peer's task id and file results
+	// against it. An agent may only ever report on work assigned to it; a task
+	// belonging to someone else is indistinguishable from one that does not
+	// exist.
 	var peerID *uuid.UUID
 	var kind string
 	var taskGroup *string
 	err = tx.QueryRow(ctx,
-		`SELECT peer_id, kind, group_name FROM tasks WHERE task_id = $1`, r.TaskID).
+		`SELECT peer_id, kind, group_name FROM tasks WHERE task_id = $1 AND agent_id = $2`,
+		r.TaskID, agentID).
 		Scan(&peerID, &kind, &taskGroup)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrNotFound
