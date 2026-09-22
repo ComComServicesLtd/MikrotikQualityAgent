@@ -133,15 +133,18 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Agent config | Implemented, tested |
 | armv7 / arm64 container image | Implemented — 880 KB static binary, 488 KB tar |
 | Controller: schema, agent endpoints, auth | Implemented |
-| Controller: mesh scheduler | Not yet — no tasks are generated, so agents lease nothing |
-| Agent controller client | Not yet — agent runs reflector-only |
-| RouterOS bandwidth-test offload | Not yet |
-| TWAMP-Light interop | Not yet |
+| Controller: mesh scheduler | Implemented, tested (full/ring/hub/partial, NAT-aware) |
+| Agent controller client + cached plan | Implemented, verified end to end |
+| Offline result spool | Implemented, tested |
 | Network discovery (wifi, ARP, DHCP, storms) | Implemented, verified against a live router |
+| RouterOS bandwidth-test offload | Not yet |
 | Discovery: traceroute, ip-scan, pcap collectors | Not yet — API verified, not wired |
+| Operator API (groups, tokens, one-off tests) | Not yet — currently raw SQL |
+| TWAMP-Light interop | Not yet |
 
-The two gaps that matter for an end-to-end run are the **mesh scheduler** (the
-controller stores and hands out tasks, but nothing creates them yet) and the
-**agent's controller client** (the agent reflects for peers but does not
-register or poll). Until both land, the agent is usable only as a reflector
-driven by a sender you invoke directly.
+The measurement loop is complete: the scheduler plans a group's mesh, agents
+lease paired sender/reflector tasks, run them, and results land in TimescaleDB.
+Verified end to end with two agents against a live controller.
+
+Enrolling an agent currently needs `psql` to insert a group and an enrolment
+token — the operator API is the most useful next piece.
