@@ -42,8 +42,12 @@ services:
       MQ_LOG: info
       # Set this to enable the operator endpoints. Left unset, they return 403.
       MQ_OPERATOR_TOKEN: ${MQ_OPERATOR_TOKEN:-}
+    # Override with MQ_PORT if 8080 is taken — on at least one dev machine
+    # something on the LAN already polls :8080 with a different API
+    # (/api/v1/session, /api/v1/ingest, /api/v1/commands), and this controller
+    # would otherwise answer those with 404s.
     ports:
-      - "8080:8080"
+      - "${MQ_PORT:-8080}:8080"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/controller", "-healthcheck"]
