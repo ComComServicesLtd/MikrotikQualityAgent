@@ -12,6 +12,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use mqagent::agent::Agent;
 use mqagent::cli;
 use mqagent::config::Config;
 use mqagent::probe::reflector::{Reflector, Registry};
@@ -161,15 +162,28 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let reflector_task = tokio::spawn(reflector.run(shutdown_rx.clone()));
 
-    // TODO: controller client — register, heartbeat, lease tasks, submit
-    // results. Until then the agent serves as a reflector only, which is
-    // already useful: a peer running the sender can measure against it.
-    info!("reflector-only mode: controller client not yet implemented");
+    // Enrolment may block for a long time if the controller is down, so the
+    // reflector is already serving peers by this point — a peer's measurement
+    // of us must not depend on our own controller connectivity.
+    let mut enrol_shutdown = shutdown_rx.clone();
+    let agent = tokio::select! {
+        res = Agent::enrol(cfg, registry.clone(), &mut enrol_shutdown) => res?,
+        _ = wait_for_shutdown() => {
+            let _ = shutdown_tx.send(true);
+            let _ = reflector_task.await;
+            return Ok(());
+        }
+    };
+
+    let agent_task = tokio::spawn(agent.run(shutdown_rx.clone()));
 
     wait_for_shutdown().await;
     info!("shutdown requested, stopping");
 
     let _ = shutdown_tx.send(true);
+    if let Err(e) = agent_task.await {
+        warn!(error = %e, "agent loop did not stop cleanly");
+    }
     if let Err(e) = reflector_task.await {
         warn!(error = %e, "reflector task did not stop cleanly");
     }

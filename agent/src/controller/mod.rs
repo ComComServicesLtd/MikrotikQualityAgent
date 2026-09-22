@@ -13,6 +13,8 @@
 //! to retry at the same moment. Un-jittered backoff would have them arrive
 //! together and knock it over again.
 
+pub mod client;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
