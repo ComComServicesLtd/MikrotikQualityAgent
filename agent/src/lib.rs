@@ -9,3 +9,4 @@ pub mod collector;
 pub mod config;
 pub mod probe;
 pub mod proto;
+pub mod spool;

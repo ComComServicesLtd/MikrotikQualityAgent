@@ -33,6 +33,8 @@ pub struct Config {
     pub log_filter: String,
     pub heartbeat_interval: Duration,
     pub poll_interval: Duration,
+    /// Bounds on the offline result queue. See [`crate::spool`].
+    pub spool: crate::spool::SpoolConfig,
 }
 
 /// Credentials for the RouterOS device hosting this container.
@@ -135,6 +137,29 @@ impl Config {
                 10u64,
                 "expected a number of seconds",
             )?),
+            spool: crate::spool::SpoolConfig::new(
+                parse_or(
+                    "MQ_SPOOL_MAX_ENTRIES",
+                    &get,
+                    crate::spool::DEFAULT_MAX_ENTRIES,
+                    "expected a number of results",
+                )?,
+                parse_or(
+                    "MQ_SPOOL_MAX_BYTES",
+                    &get,
+                    crate::spool::DEFAULT_MAX_BYTES,
+                    "expected a number of bytes",
+                )?,
+                // Expressed as a percentage rather than a fraction: an envlist
+                // value of "20" is harder to misread than "0.2".
+                parse_or(
+                    "MQ_SPOOL_ONSET_PCT",
+                    &get,
+                    (crate::spool::DEFAULT_ONSET_FRACTION * 100.0) as u32,
+                    "expected a percentage (0-90)",
+                )? as f64
+                    / 100.0,
+            ),
         })
     }
 
@@ -337,6 +362,37 @@ mod tests {
 
         m.insert("MQ_ADVERTISE_ADDR", "definitely not an ip");
         assert!(matches!(load(&m), Err(ConfigError::Invalid { var: "MQ_ADVERTISE_ADDR", .. })));
+    }
+
+    #[test]
+    fn spool_defaults_protect_the_onset() {
+        let c = load(&base()).unwrap();
+        assert_eq!(c.spool.max_entries, crate::spool::DEFAULT_MAX_ENTRIES);
+        assert!(c.spool.onset_reserve > 0, "onset protection must be on by default");
+        assert!(c.spool.onset_reserve < c.spool.max_entries);
+    }
+
+    #[test]
+    fn spool_limits_are_tunable_for_tighter_devices() {
+        let mut m = base();
+        m.insert("MQ_SPOOL_MAX_ENTRIES", "500");
+        m.insert("MQ_SPOOL_MAX_BYTES", "262144");
+        m.insert("MQ_SPOOL_ONSET_PCT", "40");
+
+        let c = load(&m).unwrap();
+        assert_eq!(c.spool.max_entries, 500);
+        assert_eq!(c.spool.max_bytes, 262_144);
+        assert_eq!(c.spool.onset_reserve, 200);
+    }
+
+    #[test]
+    fn spool_onset_percentage_cannot_consume_the_whole_spool() {
+        // 100% would leave nothing evictable and the spool would jam.
+        let mut m = base();
+        m.insert("MQ_SPOOL_MAX_ENTRIES", "100");
+        m.insert("MQ_SPOOL_ONSET_PCT", "100");
+        let c = load(&m).unwrap();
+        assert!(c.spool.onset_reserve < c.spool.max_entries);
     }
 
     #[test]
