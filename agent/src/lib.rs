@@ -6,7 +6,9 @@
 
 pub mod cli;
 pub mod collector;
+pub mod controller;
 pub mod config;
 pub mod probe;
 pub mod proto;
 pub mod spool;
+pub mod tasks;
