@@ -73,8 +73,9 @@ func run(log *slog.Logger) error {
 	addr := envOr("MQ_LISTEN_ADDR", ":8080")
 	operatorToken := os.Getenv("MQ_OPERATOR_TOKEN")
 	if operatorToken == "" {
-		log.Warn("MQ_OPERATOR_TOKEN not set — management endpoints are disabled")
+		log.Warn("MQ_OPERATOR_TOKEN not set — management endpoints and the dashboard are disabled")
 	}
+	serveUI := api.UIEnabled(envOr("MQ_SERVE_UI", "true"))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -94,7 +95,7 @@ func run(log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.New(st, log, operatorToken).Routes(),
+		Handler:           api.New(st, log, operatorToken, serveUI).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,

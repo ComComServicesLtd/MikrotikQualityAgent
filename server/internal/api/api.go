@@ -27,10 +27,11 @@ type Server struct {
 	// operatorToken guards the management endpoints. Empty disables them
 	// outright, which is safer than defaulting to a well-known value.
 	operatorToken string
+	ui            bool
 }
 
-func New(st *store.Store, log *slog.Logger, operatorToken string) *Server {
-	return &Server{st: st, log: log, operatorToken: operatorToken}
+func New(st *store.Store, log *slog.Logger, operatorToken string, serveUI bool) *Server {
+	return &Server{st: st, log: log, operatorToken: operatorToken, ui: serveUI}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -48,8 +49,12 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/v1/agents/{id}/results", s.agentAuth(s.handleResults))
 
 	mux.Handle("GET /api/v1/agents", s.operatorAuth(s.handleListAgents))
+	s.operatorRoutes(mux)
+	if s.ui {
+		s.uiRoutes(mux)
+	}
 
-	return logging(s.log, mux)
+	return cors(logging(s.log, mux))
 }
 
 // --- handlers ------------------------------------------------------------

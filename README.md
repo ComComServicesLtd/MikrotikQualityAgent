@@ -39,13 +39,32 @@ deploy/     docker-compose for local dev, MikroTik helper scripts
 
 ## Quick start
 
-### Controller (local dev)
+### Controller and dashboard (local dev)
 
 ```bash
-make server-up
+MQ_OPERATOR_TOKEN=some-secret make server-up
 ```
 
-Brings up the controller and TimescaleDB on `localhost:8080`.
+Brings up the controller and TimescaleDB, serves the API on `localhost:8080`
+and the dashboard at the same address. Set `MQ_PORT` if 8080 is taken.
+
+The dashboard is a single self-contained HTML file embedded in the controller
+binary — no build step, no CDN, no separate deployment. It also runs standalone:
+copy `server/internal/api/ui/index.html` anywhere, open it, and point it at a
+controller under **Controller…**. The API sends permissive CORS headers for
+exactly this, which is safe because every endpoint authenticates with a bearer
+token and none uses cookies.
+
+Enrol an agent without touching the database:
+
+```bash
+curl -X POST localhost:8080/api/v1/groups -H "Authorization: Bearer $TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"name":"west-wan","mesh_plan":"full","interval_s":60}'
+
+curl -X POST localhost:8080/api/v1/groups/west-wan/enrolment-tokens \
+     -H "Authorization: Bearer $TOKEN"
+```
 
 ### Agent
 
@@ -154,12 +173,13 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | RouterOS bandwidth-test offload | Not yet |
 | Discovery: traceroute + ip-scan | Implemented, verified against a live router |
 | Discovery: pcap / broadcast-source attribution | Not yet — storms detected by counters only |
-| Operator API (groups, tokens, one-off tests) | Not yet — currently raw SQL |
+| Operator API (groups, tokens, agents, queries) | Implemented, tested |
+| Dashboard (embedded + standalone) | Implemented, verified with live data |
 | TWAMP-Light interop | Not yet |
 
 The measurement loop is complete: the scheduler plans a group's mesh, agents
 lease paired sender/reflector tasks, run them, and results land in TimescaleDB.
 Verified end to end with two agents against a live controller.
 
-Enrolling an agent currently needs `psql` to insert a group and an enrolment
-token — the operator API is the most useful next piece.
+Groups, enrolment tokens and agent settings are all managed over the API now;
+`psql` is no longer needed to run the system.
