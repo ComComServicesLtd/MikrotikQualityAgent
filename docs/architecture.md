@@ -147,8 +147,9 @@ Each agent has:
 - **`agent_id`** — UUID, assigned by the controller at first registration and
   persisted to disk. Survives container restarts and re-images.
 - **`name`** — human-chosen, unique, e.g. `yvr-branch-01`.
-- **`group`** — the mesh unit. Agents in the same group are scheduled to probe
-  each other. An agent belongs to exactly one group.
+- **`group`** — the agent's *home* group: where it enrolled, and what it reports
+  as its own. It may belong to further groups on top of this one — see
+  [Shared agents and group membership](#shared-agents-and-group-membership).
 
 Registration is bootstrapped with a pre-shared enrolment token; the controller
 returns a long-lived agent token used for all subsequent calls.
