@@ -381,6 +381,40 @@ Loss  5/300 lost (1.67%)  [forward 0 · reverse 5]
 All five losses were on the return path — the expected signature of UDP
 conntrack eviction, and the directional split is what makes it legible.
 
+## A public-facing responder
+
+An upstream agent at a POP differs from a customer-site one in a way that
+matters: it has a routable address, so anything that reaches the port reaches
+the responder.
+
+TWAMP-Light has **no session identifier**, so the reflector itself can only
+filter on source address. Do not rely on that alone — gate the port at the
+router as well, with an address-list rather than a bare accept, so unwanted
+traffic is dropped before it reaches the container:
+
+```bash
+/ip/firewall/address-list/add list=mq-probe-sources address=<customer-egress> \
+    comment="site name"
+
+/ip/firewall/nat/add chain=dstnat action=dst-nat protocol=udp dst-port=862 \
+    in-interface=ether1 src-address-list=mq-probe-sources \
+    to-addresses=172.21.0.2 to-ports=862 \
+    comment="MikrotikQualityAgent TWAMP responder"
+```
+
+Adding a customer is then one address-list entry, and the port stays closed to
+everyone else. Keep `MQ_TWAMP_PEERS` populated too: the two controls fail
+independently, and an address-list edited by mistake should not silently turn
+the responder into an open reflector.
+
+Verify the gate rather than assuming it. Point the address-list somewhere else,
+probe, and confirm you get **silence** — not an error, silence — then restore
+it.
+
+Note also that the container's veth subnet must not collide with anything
+already on the device. A POP router may well be hosting other containers; check
+`/interface/veth/print` before picking a range.
+
 ## Troubleshooting
 
 | Symptom | Cause |

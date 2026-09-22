@@ -46,7 +46,11 @@ agent-image-arm64: | $(DIST) ## Build arm64 image and export a RouterOS-importab
 	    --build-arg TARGET=aarch64-unknown-linux-musl \
 	    -t mqagent:$(AGENT_VERSION)-arm64 agent/
 	docker save mqagent:$(AGENT_VERSION)-arm64 -o $(DIST)/mqagent-$(AGENT_VERSION)-arm64.tar
-	@echo "-> $(DIST)/mqagent-$(AGENT_VERSION)-arm64.tar ($$(du -h $(DIST)/mqagent-$(AGENT_VERSION)-arm64.tar | cut -f1))"
+	python3 deploy/mikrotik/oci-to-docker-archive.py \
+	    $(DIST)/mqagent-$(AGENT_VERSION)-arm64.tar \
+	    $(DIST)/mqagent-$(AGENT_VERSION)-arm64-ros.tar \
+	    mqagent:$(AGENT_VERSION)-arm64
+	@echo "-> import this one onto RouterOS: $(DIST)/mqagent-$(AGENT_VERSION)-arm64-ros.tar"
 
 # `docker save` (OCI archive), not `docker export` (flat rootfs) — RouterOS
 # needs the manifest and layers. `--output=type=docker` above is equally
