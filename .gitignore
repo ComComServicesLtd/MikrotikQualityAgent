@@ -1,0 +1,24 @@
+# Rust
+/agent/target/
+**/*.rs.bk
+
+# Go
+/server/bin/
+/server/controller
+
+# Build artifacts
+/dist/
+*.tar
+*.tar.gz
+
+# Local env / secrets
+.env
+*.local.yml
+agent-*.toml
+!agent/agent.example.toml
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

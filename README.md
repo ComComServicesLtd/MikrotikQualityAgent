@@ -1,0 +1,89 @@
+# MikroTik Quality Agent
+
+A distributed network quality measurement system. Rust agents run as RouterOS
+containers on MikroTik routers, probe each other in a mesh, and report latency,
+jitter, loss, reordering, DSCP conformance, voice MOS and throughput to a
+central Go controller.
+
+## What it measures
+
+| Metric | How |
+|---|---|
+| **RTT** min/avg/max/stddev, p50/p95/p99 | UDP probes, reflector processing time subtracted out |
+| **Jitter** | IPDV (RFC 3393) and PDV — both, because monitoring systems disagree on which "jitter" means |
+| **Loss**, split forward vs reverse | The reflector's own counter reveals which direction dropped the packet |
+| **Reordering** and duplication | RFC 4737, with displacement |
+| **DSCP conformance** | The reflector reports the DSCP it actually received, exposing remarking and bleaching along the path |
+| **MOS / R-factor** | ITU-T G.107 E-model, per codec |
+| **Throughput** | Offloaded to the host router's `/tool/bandwidth-test`, so it measures the router's forwarding path rather than the container's veth |
+
+One-way delay is deliberately **not** reported in v1 — it needs clock
+synchronisation whose error would exceed the jitter we are trying to measure.
+See [`docs/protocol.md`](docs/protocol.md).
+
+## Layout
+
+```
+agent/      Rust agent — static musl binary in a scratch image
+server/     Go controller + TimescaleDB
+docs/       Architecture, wire protocol, REST API, deployment
+deploy/     docker-compose for local dev, MikroTik helper scripts
+```
+
+## Documentation
+
+- [Architecture](docs/architecture.md) — components, decisions, and why
+- [Wire protocol](docs/protocol.md) — the MQP packet format
+- [REST API](docs/api.md) — the agent ↔ controller contract
+- [MikroTik deployment](docs/deployment-mikrotik.md) — the part with the sharp edges
+
+## Quick start
+
+### Controller (local dev)
+
+```bash
+make server-up
+```
+
+Brings up the controller and TimescaleDB on `localhost:8080`.
+
+### Agent
+
+Build the image for your router's architecture:
+
+```bash
+make agent-image-armv7
+```
+
+Then follow [the deployment guide](docs/deployment-mikrotik.md). Two things
+catch everyone out:
+
+1. RouterOS needs **both** `container=yes` and `bandwidth-test=yes` in
+   device-mode. Devices shipping with 7.17+ default to `home` mode, where
+   bandwidth-test is disabled.
+2. The image must be a `docker save` archive built with
+   `--output=type=docker`. `docker export` output will not import.
+
+### Tests
+
+```bash
+make test
+```
+
+The agent's tests run a real reflector and sender over loopback, including DSCP
+echo through actual `recvmsg` control messages — no mocking of the data plane.
+
+## Status
+
+| Component | State |
+|---|---|
+| MQP wire protocol | Implemented, tested |
+| Probe sender / reflector | Implemented, tested |
+| Statistics (RTT, jitter, loss, reorder, DSCP) | Implemented, tested |
+| MOS / R-factor | Implemented, tested |
+| Config | Implemented, tested |
+| armv7 / arm64 container image | Implemented |
+| Controller REST API | Contract specified; implementation in progress |
+| Agent controller client | Not yet implemented — agent runs reflector-only |
+| RouterOS bandwidth-test offload | Not yet implemented |
+| TWAMP-Light interop | Not yet implemented |

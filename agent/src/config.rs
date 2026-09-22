@@ -1,0 +1,353 @@
+//! Agent configuration.
+//!
+//! Everything comes from environment variables. A `scratch` image has no shell
+//! and no convenient way to manage a config file, and RouterOS parameterises
+//! containers through `/container/envs` envlists — so environment variables are
+//! both the simplest and the native mechanism here.
+
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// Controller base URL, e.g. `https://controller.example.net`.
+    pub controller_url: String,
+    /// Pre-shared enrolment token, used once at first registration.
+    pub enrolment_token: String,
+    /// Human-chosen unique name, e.g. `yvr-branch-01`.
+    pub name: String,
+    /// Mesh unit. Agents in the same group are scheduled to probe each other.
+    pub group: String,
+    /// Where the reflector listens.
+    pub probe_bind: SocketAddr,
+    /// Address peers should reach this agent on. Usually discovered by the
+    /// controller from the source address of our registration, but it can be
+    /// pinned when the agent sits behind a static DNAT.
+    pub advertise_addr: Option<IpAddr>,
+    /// Where agent state (the assigned ID and token) is persisted, so a
+    /// container restart is not a new agent.
+    pub state_dir: String,
+    /// RouterOS host API, for the bandwidth-test offload. Absent means
+    /// throughput tasks are skipped with a reason rather than failed.
+    pub routeros: Option<RouterOsConfig>,
+    pub log_filter: String,
+    pub heartbeat_interval: Duration,
+    pub poll_interval: Duration,
+}
+
+/// Credentials for the RouterOS device hosting this container.
+///
+/// The host is reachable at the container's default gateway — the address
+/// assigned to the RouterOS side of the veth or its bridge. There is no
+/// `host.docker.internal` equivalent on RouterOS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterOsConfig {
+    pub host: IpAddr,
+    /// Binary API port. 8728 plaintext, 8729 TLS.
+    ///
+    /// The binary API is used rather than REST because `/tool/bandwidth-test`
+    /// is a continuous-output command: the binary API streams `!re` sentences
+    /// and supports cancellation by tag, whereas REST cannot stream and caps
+    /// commands at 60 seconds.
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub use_tls: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("{0} is required but not set")]
+    Missing(&'static str),
+    #[error("{var} is not valid: {value:?} ({reason})")]
+    Invalid { var: &'static str, value: String, reason: &'static str },
+    #[error(
+        "MQ_ROUTEROS_HOST is set but {0} is not — a partial RouterOS \
+         configuration would fail silently at the first bandwidth test"
+    )]
+    PartialRouterOs(&'static str),
+}
+
+impl Config {
+    /// Load from the process environment.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_source(|k| std::env::var(k).ok())
+    }
+
+    /// Load from an arbitrary lookup, so the parsing rules can be tested
+    /// without mutating global process state.
+    pub fn from_source<F>(get: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let required = |var: &'static str| -> Result<String, ConfigError> {
+            get(var).filter(|v| !v.trim().is_empty()).ok_or(ConfigError::Missing(var))
+        };
+
+        let controller_url = required("MQ_CONTROLLER_URL")?;
+        if !controller_url.starts_with("http://") && !controller_url.starts_with("https://") {
+            return Err(ConfigError::Invalid {
+                var: "MQ_CONTROLLER_URL",
+                value: controller_url,
+                reason: "must start with http:// or https://",
+            });
+        }
+
+        let name = required("MQ_AGENT_NAME")?;
+        let group = required("MQ_AGENT_GROUP")?;
+        let enrolment_token = required("MQ_ENROLMENT_TOKEN")?;
+
+        let probe_port = parse_or("MQ_PROBE_PORT", &get, 5301u16, "expected a port number")?;
+        let probe_bind = SocketAddr::from(([0, 0, 0, 0], probe_port));
+
+        let advertise_addr = match get("MQ_ADVERTISE_ADDR") {
+            Some(v) if !v.trim().is_empty() => Some(v.trim().parse::<IpAddr>().map_err(|_| {
+                ConfigError::Invalid {
+                    var: "MQ_ADVERTISE_ADDR",
+                    value: v,
+                    reason: "expected an IP address",
+                }
+            })?),
+            _ => None,
+        };
+
+        let routeros = Self::routeros_from(&get)?;
+
+        Ok(Self {
+            controller_url: controller_url.trim_end_matches('/').to_string(),
+            enrolment_token,
+            name,
+            group,
+            probe_bind,
+            advertise_addr,
+            state_dir: get("MQ_STATE_DIR").unwrap_or_else(|| "/var/lib/mqagent".into()),
+            routeros,
+            log_filter: get("MQ_LOG").unwrap_or_else(|| "info".into()),
+            heartbeat_interval: Duration::from_secs(parse_or(
+                "MQ_HEARTBEAT_SECS",
+                &get,
+                30u64,
+                "expected a number of seconds",
+            )?),
+            poll_interval: Duration::from_secs(parse_or(
+                "MQ_POLL_SECS",
+                &get,
+                10u64,
+                "expected a number of seconds",
+            )?),
+        })
+    }
+
+    fn routeros_from<F>(get: &F) -> Result<Option<RouterOsConfig>, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let Some(host) = get("MQ_ROUTEROS_HOST").filter(|v| !v.trim().is_empty()) else {
+            return Ok(None);
+        };
+
+        let host = host.trim().parse::<IpAddr>().map_err(|_| ConfigError::Invalid {
+            var: "MQ_ROUTEROS_HOST",
+            value: host.clone(),
+            reason: "expected an IP address — usually the container's default gateway",
+        })?;
+
+        // Half-configured credentials are worse than none: the agent would
+        // advertise the bandwidth-test capability, be scheduled throughput
+        // work, and fail every task at run time.
+        let username = get("MQ_ROUTEROS_USER")
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(ConfigError::PartialRouterOs("MQ_ROUTEROS_USER"))?;
+        let password = get("MQ_ROUTEROS_PASS")
+            .filter(|v| !v.is_empty())
+            .ok_or(ConfigError::PartialRouterOs("MQ_ROUTEROS_PASS"))?;
+
+        let use_tls = parse_bool(get("MQ_ROUTEROS_TLS").as_deref(), false);
+        let default_port = if use_tls { 8729 } else { 8728 };
+        let port = parse_or("MQ_ROUTEROS_PORT", get, default_port, "expected a port number")?;
+
+        Ok(Some(RouterOsConfig { host, port, username, password, use_tls }))
+    }
+
+    /// Whether this agent can offload throughput tests to its host router.
+    pub fn can_bandwidth_test(&self) -> bool {
+        self.routeros.is_some()
+    }
+}
+
+fn parse_or<T, F>(var: &'static str, get: &F, default: T, reason: &'static str) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr,
+    F: Fn(&str) -> Option<String>,
+{
+    match get(var) {
+        Some(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse::<T>()
+            .map_err(|_| ConfigError::Invalid { var, value: v, reason }),
+        _ => Ok(default),
+    }
+}
+
+fn parse_bool(v: Option<&str>, default: bool) -> bool {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn base() -> HashMap<&'static str, &'static str> {
+        HashMap::from([
+            ("MQ_CONTROLLER_URL", "https://controller.example.net"),
+            ("MQ_AGENT_NAME", "yvr-branch-01"),
+            ("MQ_AGENT_GROUP", "west-wan"),
+            ("MQ_ENROLMENT_TOKEN", "enrol-secret"),
+        ])
+    }
+
+    fn load(map: &HashMap<&'static str, &'static str>) -> Result<Config, ConfigError> {
+        Config::from_source(|k| map.get(k).map(|v| v.to_string()))
+    }
+
+    #[test]
+    fn minimal_configuration_loads_with_sane_defaults() {
+        let c = load(&base()).unwrap();
+        assert_eq!(c.name, "yvr-branch-01");
+        assert_eq!(c.group, "west-wan");
+        assert_eq!(c.probe_bind.port(), 5301);
+        assert_eq!(c.state_dir, "/var/lib/mqagent");
+        assert_eq!(c.heartbeat_interval, Duration::from_secs(30));
+        assert!(!c.can_bandwidth_test(), "no RouterOS config means no throughput offload");
+    }
+
+    #[test]
+    fn every_required_variable_is_enforced() {
+        for missing in
+            ["MQ_CONTROLLER_URL", "MQ_AGENT_NAME", "MQ_AGENT_GROUP", "MQ_ENROLMENT_TOKEN"]
+        {
+            let mut m = base();
+            m.remove(missing);
+            match load(&m) {
+                Err(ConfigError::Missing(var)) => assert_eq!(var, missing),
+                other => panic!("expected {missing} to be required, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn blank_values_count_as_missing() {
+        // RouterOS envlists make it easy to define a key with an empty value;
+        // treating that as "set" would produce confusing downstream failures.
+        let mut m = base();
+        m.insert("MQ_AGENT_NAME", "   ");
+        assert!(matches!(load(&m), Err(ConfigError::Missing("MQ_AGENT_NAME"))));
+    }
+
+    #[test]
+    fn controller_url_must_carry_a_scheme() {
+        let mut m = base();
+        m.insert("MQ_CONTROLLER_URL", "controller.example.net");
+        assert!(matches!(
+            load(&m),
+            Err(ConfigError::Invalid { var: "MQ_CONTROLLER_URL", .. })
+        ));
+    }
+
+    #[test]
+    fn trailing_slash_on_controller_url_is_normalised() {
+        // Otherwise every request path would come out doubled-up.
+        let mut m = base();
+        m.insert("MQ_CONTROLLER_URL", "https://controller.example.net/");
+        assert_eq!(load(&m).unwrap().controller_url, "https://controller.example.net");
+    }
+
+    #[test]
+    fn routeros_defaults_to_the_plaintext_binary_api_port() {
+        let mut m = base();
+        m.insert("MQ_ROUTEROS_HOST", "172.17.0.1");
+        m.insert("MQ_ROUTEROS_USER", "btagent");
+        m.insert("MQ_ROUTEROS_PASS", "secret");
+
+        let ros = load(&m).unwrap().routeros.unwrap();
+        assert_eq!(ros.port, 8728);
+        assert!(!ros.use_tls);
+        assert_eq!(ros.host, "172.17.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn enabling_tls_moves_the_default_routeros_port() {
+        let mut m = base();
+        m.insert("MQ_ROUTEROS_HOST", "172.17.0.1");
+        m.insert("MQ_ROUTEROS_USER", "btagent");
+        m.insert("MQ_ROUTEROS_PASS", "secret");
+        m.insert("MQ_ROUTEROS_TLS", "yes");
+
+        let ros = load(&m).unwrap().routeros.unwrap();
+        assert!(ros.use_tls);
+        assert_eq!(ros.port, 8729);
+    }
+
+    #[test]
+    fn partial_routeros_credentials_are_rejected_loudly() {
+        // The failure mode this prevents: the agent advertises the
+        // bandwidth-test capability, gets scheduled throughput work, and then
+        // fails every single task at run time.
+        let mut m = base();
+        m.insert("MQ_ROUTEROS_HOST", "172.17.0.1");
+        assert!(matches!(load(&m), Err(ConfigError::PartialRouterOs("MQ_ROUTEROS_USER"))));
+
+        m.insert("MQ_ROUTEROS_USER", "btagent");
+        assert!(matches!(load(&m), Err(ConfigError::PartialRouterOs("MQ_ROUTEROS_PASS"))));
+    }
+
+    #[test]
+    fn routeros_host_must_be_an_ip_not_a_hostname() {
+        // A scratch image has no resolver configured by default, so a hostname
+        // here would fail at connect time with a much less obvious error.
+        let mut m = base();
+        m.insert("MQ_ROUTEROS_HOST", "my-router.lan");
+        m.insert("MQ_ROUTEROS_USER", "btagent");
+        m.insert("MQ_ROUTEROS_PASS", "secret");
+        assert!(matches!(load(&m), Err(ConfigError::Invalid { var: "MQ_ROUTEROS_HOST", .. })));
+    }
+
+    #[test]
+    fn numeric_fields_reject_garbage_rather_than_defaulting() {
+        let mut m = base();
+        m.insert("MQ_PROBE_PORT", "not-a-port");
+        assert!(matches!(load(&m), Err(ConfigError::Invalid { var: "MQ_PROBE_PORT", .. })));
+    }
+
+    #[test]
+    fn advertise_address_is_optional_but_validated() {
+        let mut m = base();
+        assert!(load(&m).unwrap().advertise_addr.is_none());
+
+        m.insert("MQ_ADVERTISE_ADDR", "203.0.113.24");
+        assert_eq!(
+            load(&m).unwrap().advertise_addr,
+            Some("203.0.113.24".parse::<IpAddr>().unwrap())
+        );
+
+        m.insert("MQ_ADVERTISE_ADDR", "definitely not an ip");
+        assert!(matches!(load(&m), Err(ConfigError::Invalid { var: "MQ_ADVERTISE_ADDR", .. })));
+    }
+
+    #[test]
+    fn boolean_parsing_accepts_the_usual_spellings() {
+        assert!(parse_bool(Some("yes"), false));
+        assert!(parse_bool(Some("TRUE"), false));
+        assert!(parse_bool(Some("1"), false));
+        assert!(parse_bool(Some(" on "), false));
+        assert!(!parse_bool(Some("no"), true));
+        assert!(!parse_bool(Some("0"), true));
+        assert!(parse_bool(None, true), "absent falls back to the default");
+        assert!(parse_bool(Some("banana"), true), "unrecognised falls back too");
+    }
+}

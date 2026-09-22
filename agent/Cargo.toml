@@ -1,0 +1,44 @@
+[package]
+name = "mqagent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Remote TCP/UDP network quality testing agent for MikroTik RouterOS containers"
+license = "Proprietary"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread", "net", "time", "sync", "signal", "macros", "fs", "io-util",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "rustls-tls", "gzip",
+] }
+socket2 = { version = "0.5", features = ["all"] }
+# recvmsg + IP_RECVTOS/IP_RECVTTL control messages, so the reflector can report
+# the DSCP and TTL a packet actually arrived with. std and tokio expose no way
+# to read these, and `nix` surfaces them only as opaque `Unknown` cmsgs — so we
+# walk the control buffer directly.
+libc = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde-well-known"] }
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+# armv7 with 256 MB RAM: optimise hard for size, and keep the binary honest
+# about panics — a probe agent that unwinds into a half-state is worse than one
+# that dies and is restarted by RouterOS.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
