@@ -44,6 +44,10 @@ type Capabilities struct {
 	TwampLight    bool `json:"twamp_light"`
 	RouterOSBtest bool `json:"routeros_btest"`
 	ProbePort     int  `json:"probe_port"`
+	// The responder listens on its own port: MQP's magic and a TWAMP sequence
+	// number can collide, so they cannot share one. A peer cannot reach it
+	// without being told which port it is.
+	TwampPort int `json:"twamp_port,omitempty"`
 }
 
 type HostInfo struct {

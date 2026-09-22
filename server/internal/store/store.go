@@ -111,6 +111,10 @@ type RegisterResult struct {
 	AgentID uuid.UUID
 	Token   string
 	Group   string
+	// True when an existing name was taken over by a device that had lost its
+	// identity. Worth logging: it is normal after a re-flash and suspicious
+	// otherwise.
+	Reclaimed bool
 }
 
 // RedeemEnrolment validates a group-scoped, single-use enrolment token.
@@ -126,17 +130,29 @@ func (s *Store) RedeemEnrolment(ctx context.Context, token string) (string, erro
 	return group, err
 }
 
-// Register creates or refreshes an agent.
+// Register creates, refreshes, or reclaims an agent.
 //
 // Re-registering an existing name with a matching agent_id refreshes metadata
 // and issues a new token, so a container restart is the same agent rather than
-// a new one. A name arriving with a *different* agent_id is a conflict, not a
-// silent takeover.
+// a new one.
+//
+// A name arriving with no agent_id, or a different one, is a *reclaim*. It is
+// permitted only when the enrolment token grants the group the existing agent
+// already belongs to — and the caller has necessarily presented a valid,
+// single-use token to get this far, which is the authorisation. Refusing it
+// outright looked safer but stranded any device that lost its state: a
+// re-flashed router, a container recreated with a new root-dir, a wiped mount.
+// Such an agent could never enrol under its own name again and simply
+// crash-looped, recoverable only by an operator deleting the record.
+//
+// The reclaim keeps the existing agent_id so historical results stay attached
+// to the device rather than splitting across two identities.
 func (s *Store) Register(ctx context.Context, req RegisterRequest) (RegisterResult, error) {
 	token, hash, err := NewToken()
 	if err != nil {
 		return RegisterResult{}, err
 	}
+	reclaimed := false
 
 	probeAddr := req.AdvertiseAddr
 	if probeAddr == "" {
@@ -150,15 +166,23 @@ func (s *Store) Register(ctx context.Context, req RegisterRequest) (RegisterResu
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var existingID uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT agent_id FROM agents WHERE name = $1`, req.Name).Scan(&existingID)
+	var existingGroup string
+	err = tx.QueryRow(ctx,
+		`SELECT agent_id, group_name FROM agents WHERE name = $1`, req.Name).
+		Scan(&existingID, &existingGroup)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		// New agent.
 	case err != nil:
 		return RegisterResult{}, err
 	case req.AgentID != nil && *req.AgentID == existingID:
-		// Known agent coming back.
+		// Known agent coming back with its own identity.
+	case existingGroup == req.Group:
+		// Reclaim: a valid token for the same group, from a device that lost
+		// its state. Keep the id so its history follows it.
+		reclaimed = true
 	default:
+		// A token for one group must not be able to seize a name in another.
 		return RegisterResult{}, ErrNameConflict
 	}
 
@@ -201,7 +225,7 @@ func (s *Store) Register(ctx context.Context, req RegisterRequest) (RegisterResu
 	if err := tx.Commit(ctx); err != nil {
 		return RegisterResult{}, err
 	}
-	return RegisterResult{AgentID: id, Token: token, Group: req.Group}, nil
+	return RegisterResult{AgentID: id, Token: token, Group: req.Group, Reclaimed: reclaimed}, nil
 }
 
 // MarkEnrolmentUsed burns a single-use token. Called after a successful

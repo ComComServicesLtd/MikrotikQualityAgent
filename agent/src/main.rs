@@ -169,6 +169,32 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let reflector_task = tokio::spawn(reflector.run(shutdown_rx.clone()));
 
+    // A managed agent answers TWAMP too when configured, so that switching a
+    // standalone responder into the mesh does not take that service away.
+    let mut twamp_task = None;
+    if let Some(tport) = cfg.twamp_port {
+        use mqagent::probe::twamp::{AllowList, TwampReflector};
+        let mut allow =
+            if cfg.twamp_peers.is_empty() { AllowList::open() } else { AllowList::new() };
+        for p in &cfg.twamp_peers {
+            allow.allow(*p);
+        }
+        let open = cfg.twamp_peers.is_empty();
+        let tbind: std::net::SocketAddr = ([0, 0, 0, 0], tport).into();
+        match TwampReflector::bind(tbind, Arc::new(Mutex::new(allow))).await {
+            Ok(tr) => {
+                info!(addr = %tr.local_addr()?, open, "TWAMP-Light responder listening");
+                if open {
+                    warn!("TWAMP is answering any source — set MQ_TWAMP_PEERS to restrict it");
+                }
+                twamp_task = Some(tokio::spawn(tr.run(shutdown_rx.clone())));
+            }
+            // Not fatal: the agent's own measurement work is unaffected, and
+            // losing the whole agent over an interop extra would be worse.
+            Err(e) => warn!(error = %e, port = tport, "could not start the TWAMP responder"),
+        }
+    }
+
     // Enrolment may block for a long time if the controller is down, so the
     // reflector is already serving peers by this point — a peer's measurement
     // of us must not depend on our own controller connectivity.
@@ -193,6 +219,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     if let Err(e) = reflector_task.await {
         warn!(error = %e, "reflector task did not stop cleanly");
+    }
+    if let Some(t) = twamp_task {
+        let _ = t.await;
     }
 
     Ok(())

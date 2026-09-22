@@ -138,7 +138,13 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("could not burn enrolment token", "error", err, "agent", res.AgentID)
 	}
 
-	s.log.Info("agent registered", "name", req.Name, "group", group, "id", res.AgentID)
+	if res.Reclaimed {
+		s.log.Warn("agent reclaimed an existing name with a fresh enrolment token",
+			"name", req.Name, "group", group, "id", res.AgentID,
+			"note", "expected after a re-flash or a recreated container; investigate otherwise")
+	} else {
+		s.log.Info("agent registered", "name", req.Name, "group", group, "id", res.AgentID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agent_id":             res.AgentID,
 		"token":                res.Token,
@@ -148,10 +154,28 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type heartbeatRequest struct {
+	// Optional: older agents do not send it, and a heartbeat that fails to
+	// decode would mark a healthy agent stale.
+	Capabilities *model.Capabilities `json:"capabilities"`
+}
+
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, a model.Agent) {
+	var req heartbeatRequest
+	// Ignore a malformed body rather than failing the beat: liveness matters
+	// more than the optional payload riding along with it.
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
+
 	if err := s.st.Heartbeat(r.Context(), a.AgentID); err != nil {
 		s.fail(w, "heartbeat", err)
 		return
+	}
+	// An agent that keeps its identity never registers again, so this is the
+	// only route by which a newly gained capability reaches us.
+	if req.Capabilities != nil {
+		if err := s.st.UpdateCapabilities(r.Context(), a.AgentID, *req.Capabilities); err != nil {
+			s.log.Error("could not update capabilities", "agent", a.AgentID, "error", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"poll_interval_s": 10,

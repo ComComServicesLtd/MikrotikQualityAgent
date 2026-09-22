@@ -35,6 +35,15 @@ pub struct Config {
     pub poll_interval: Duration,
     /// Bounds on the offline result queue. See [`crate::spool`].
     pub spool: crate::spool::SpoolConfig,
+    /// When set, a TWAMP-Light responder runs alongside the managed agent.
+    ///
+    /// A managed agent already reflects MQP for its peers; answering TWAMP as
+    /// well costs one more socket and lets the same device serve carriers and
+    /// test sets that will never run an agent of ours. Without this, switching
+    /// a standalone responder over to managed mode would silently take its
+    /// TWAMP service away.
+    pub twamp_port: Option<u16>,
+    pub twamp_peers: Vec<IpAddr>,
 }
 
 /// Credentials for the RouterOS device hosting this container.
@@ -137,6 +146,31 @@ impl Config {
                 10u64,
                 "expected a number of seconds",
             )?),
+            twamp_port: match get("MQ_TWAMP_PORT") {
+                Some(v) if !v.trim().is_empty() => Some(v.trim().parse::<u16>().map_err(|_| {
+                    ConfigError::Invalid {
+                        var: "MQ_TWAMP_PORT",
+                        value: v,
+                        reason: "expected a port number",
+                    }
+                })?),
+                _ => None,
+            },
+            twamp_peers: match get("MQ_TWAMP_PEERS") {
+                Some(v) if !v.trim().is_empty() => v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        p.parse::<IpAddr>().map_err(|_| ConfigError::Invalid {
+                            var: "MQ_TWAMP_PEERS",
+                            value: p.to_string(),
+                            reason: "expected a comma-separated list of IP addresses",
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => vec![],
+            },
             spool: crate::spool::SpoolConfig::new(
                 parse_or(
                     "MQ_SPOOL_MAX_ENTRIES",
@@ -383,6 +417,34 @@ mod tests {
 
         m.insert("MQ_ADVERTISE_ADDR", "definitely not an ip");
         assert!(matches!(load(&m), Err(ConfigError::Invalid { var: "MQ_ADVERTISE_ADDR", .. })));
+    }
+
+    #[test]
+    fn a_managed_agent_can_also_answer_twamp() {
+        // Otherwise switching a standalone responder to managed mode silently
+        // removes the TWAMP service it was deployed for.
+        let mut m = base();
+        m.insert("MQ_TWAMP_PORT", "862");
+        m.insert("MQ_TWAMP_PEERS", "162.216.190.1, 10.0.0.5");
+
+        let c = load(&m).unwrap();
+        assert_eq!(c.twamp_port, Some(862));
+        assert_eq!(c.twamp_peers.len(), 2);
+    }
+
+    #[test]
+    fn twamp_is_off_unless_a_port_is_given() {
+        let c = load(&base()).unwrap();
+        assert!(c.twamp_port.is_none());
+        assert!(c.twamp_peers.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_twamp_peer_is_rejected_not_skipped() {
+        let mut m = base();
+        m.insert("MQ_TWAMP_PORT", "862");
+        m.insert("MQ_TWAMP_PEERS", "10.0.0.1,nonsense");
+        assert!(matches!(load(&m), Err(ConfigError::Invalid { var: "MQ_TWAMP_PEERS", .. })));
     }
 
     #[test]

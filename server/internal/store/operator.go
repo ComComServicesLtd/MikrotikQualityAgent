@@ -177,6 +177,14 @@ func (s *Store) PatchAgent(ctx context.Context, id uuid.UUID, p AgentPatch) erro
 	return nil
 }
 
+// UpdateCapabilities records what an agent currently reports it can do.
+func (s *Store) UpdateCapabilities(ctx context.Context, id uuid.UUID, c model.Capabilities) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE agents SET capabilities = $2, probe_port = $3 WHERE agent_id = $1`,
+		id, c, c.ProbePort)
+	return err
+}
+
 func (s *Store) DeleteAgent(ctx context.Context, id uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM agents WHERE agent_id = $1`, id)
 	if err != nil {

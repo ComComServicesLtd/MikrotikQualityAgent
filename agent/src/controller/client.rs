@@ -31,6 +31,8 @@ pub struct Capabilities {
     pub twamp_light: bool,
     pub routeros_btest: bool,
     pub probe_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twamp_port: Option<u16>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -56,6 +58,14 @@ pub struct RegisterResponse {
 
 #[derive(Debug, Serialize)]
 pub struct HeartbeatRequest {
+    /// Sent every beat, not only at registration.
+    ///
+    /// An agent that keeps its persisted identity never registers again, so a
+    /// capability it gains later -- a TWAMP responder switched on, RouterOS
+    /// credentials added -- would never reach the controller, which would go
+    /// on refusing work the agent can now do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
     pub uptime_s: u64,
     pub active_sessions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]

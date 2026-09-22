@@ -123,12 +123,7 @@ impl Agent {
             name: cfg.name.clone(),
             group: cfg.group.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            capabilities: Capabilities {
-                mqp: true,
-                twamp_light: false,
-                routeros_btest: cfg.can_bandwidth_test(),
-                probe_port: cfg.probe_bind.port(),
-            },
+            capabilities: Self::caps_from(&cfg),
             host: HostInfo::default(),
             advertise_addr: cfg.advertise_addr.map(|a| a.to_string()),
         };
@@ -166,6 +161,26 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// What this agent can currently do, derived from configuration.
+    fn caps_from(cfg: &Config) -> Capabilities {
+        Capabilities {
+            mqp: true,
+            // Reported from configuration rather than hardcoded. Claiming
+            // false while a responder is listening makes the controller refuse
+            // TWAMP tests against a device that can serve them.
+            twamp_light: cfg.twamp_port.is_some(),
+            routeros_btest: cfg.can_bandwidth_test(),
+            probe_port: cfg.probe_bind.port(),
+            // A peer cannot reach our responder without knowing its port, and
+            // it is not the MQP one.
+            twamp_port: cfg.twamp_port,
+        }
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Self::caps_from(&self.cfg)
     }
 
     fn assemble(
@@ -215,6 +230,7 @@ impl Agent {
         let mut backoff = Backoff::default();
         loop {
             let req = HeartbeatRequest {
+                capabilities: None,
                 uptime_s: 0,
                 active_sessions: registry.lock().await.active_count(),
                 last_error: None,
@@ -367,6 +383,7 @@ impl Agent {
     async fn heartbeat(&mut self) -> bool {
         let s = self.spool.stats();
         let req = HeartbeatRequest {
+            capabilities: Some(self.capabilities()),
             uptime_s: self.started.elapsed().as_secs(),
             active_sessions: self.registry.lock().await.active_count(),
             last_error: self.last_error.clone(),
