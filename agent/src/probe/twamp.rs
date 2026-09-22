@@ -403,13 +403,14 @@ fn accept(
 
     Some(Sample {
         seq: r.sender_sequence,
-        reflector_seq: r.sequence,
+        // Light mode has no session, so the responder counter spans all peers
+        // and cannot tell this sender anything about its own return path.
+        reflector_seq: None,
         rtt_ns: rtt.as_nanos().min(u64::MAX as u128) as u64,
         tx_dscp: cfg.dscp.unwrap_or(0),
         // TWAMP has no field for the class a packet arrived in, so DSCP
-        // conformance is genuinely unavailable rather than zero. The collector
-        // reports it as missing.
-        rx_dscp: 0,
+        // conformance is genuinely unavailable rather than zero.
+        rx_dscp: None,
         arrival_index,
     })
 }
@@ -504,14 +505,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reflector_sequence_advances_so_reverse_loss_is_visible() {
+    async fn twamp_samples_carry_no_direction_attribution() {
+        // The responder's counter spans every peer at once, so it says nothing
+        // about this sender's return path. Two customers probing one upstream
+        // would otherwise each read the other's replies as their own reverse
+        // loss and report heavy loss on a healthy path.
         let (addr, _sd) = spawn(AllowList::open()).await;
         let run = run(&cfg(addr, 6)).await.unwrap();
+        assert!(!run.samples.is_empty());
+        assert!(
+            run.samples.iter().all(|s| s.reflector_seq.is_none()),
+            "TWAMP must not claim a direction it cannot know"
+        );
 
-        let mut seqs: Vec<u32> = run.samples.iter().map(|s| s.reflector_seq).collect();
-        seqs.sort_unstable();
-        seqs.dedup();
-        assert_eq!(seqs.len(), run.samples.len(), "each reply needs its own counter value");
+        let l = stats::summarise(run.sent, &run.samples, None).loss;
+        assert_eq!(l.reverse_lost, 0);
+        assert_eq!(l.forward_lost, 0);
     }
 
     #[tokio::test]

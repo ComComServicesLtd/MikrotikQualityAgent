@@ -10,14 +10,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
     pub seq: u32,
-    /// Reflector's own counter, used to separate reverse loss from forward loss.
-    pub reflector_seq: u32,
+    /// Reflector's own counter, used to separate reverse loss from forward
+    /// loss.
+    ///
+    /// `None` when the protocol cannot attribute a direction at all. TWAMP-Light
+    /// is the case: it has no session, so a responder's counter advances across
+    /// every peer at once. Two customers probing one upstream would each see
+    /// the other's replies consume counter values, read the gaps as their own
+    /// reverse loss, and report heavy loss on a healthy path. Encoding the
+    /// absence here rather than passing a flag means a protocol that cannot
+    /// know simply cannot claim.
+    pub reflector_seq: Option<u32>,
     /// Corrected round trip: `(t4 - t1) - (t3 - t2)`, in nanoseconds.
     pub rtt_ns: u64,
     /// DSCP we asked for.
     pub tx_dscp: u8,
-    /// DSCP the reflector saw. Meaningful only when the reflector echoed it.
-    pub rx_dscp: u8,
+    /// DSCP the reflector actually observed on arrival.
+    ///
+    /// `None` when the peer did not report one at all — TWAMP has no such
+    /// field, and a reflector whose kernel withheld the control message cannot
+    /// know either. `Some(0)` is entirely different: the packet genuinely
+    /// arrived as best-effort, which means something on the path bleached the
+    /// marking. Collapsing those two into a bare `0` hid exactly the finding
+    /// this metric exists to produce.
+    pub rx_dscp: Option<u8>,
     /// Order of arrival at the sender, 0-based. Distinct from `seq`, which is
     /// order of departure — the difference is what reordering means.
     pub arrival_index: u32,
@@ -188,12 +204,27 @@ fn jitter_stats(samples: &[Sample]) -> Option<JitterStats> {
 fn loss_stats(sent: u32, samples: &[Sample]) -> LossStats {
     let received = samples.len() as u32;
     let missing = sent.saturating_sub(received);
+    let loss_pct = if sent == 0 { 0.0 } else { (missing as f64 / sent as f64) * 100.0 };
+
+    // Every sample must carry a counter before any attribution is attempted.
+    // Guessing from a protocol that cannot tell us is worse than admitting we
+    // do not know: a wrong direction sends someone to the wrong end of a path.
+    if !samples.iter().all(|s| s.reflector_seq.is_some()) {
+        return LossStats {
+            sent,
+            received,
+            forward_lost: 0,
+            reverse_lost: 0,
+            unknown_direction: missing,
+            loss_pct: round2(loss_pct),
+        };
+    }
 
     // `reflector_seq` increments once per reply the reflector generated. If we
     // saw its highest value but are missing packets in between, those replies
     // existed and died on the way back. Requests that never reached the
     // reflector never advanced its counter at all.
-    let highest_reflector_seq = samples.iter().map(|s| s.reflector_seq).max();
+    let highest_reflector_seq = samples.iter().filter_map(|s| s.reflector_seq).max();
     let distinct_replies = samples.len() as u32;
 
     let (forward_lost, reverse_lost, unknown) = match highest_reflector_seq {
@@ -207,9 +238,6 @@ fn loss_stats(sent: u32, samples: &[Sample]) -> LossStats {
         // Nothing came back at all — we cannot attribute a direction.
         None => (0, 0, missing),
     };
-
-    let loss_pct =
-        if sent == 0 { 0.0 } else { (missing as f64 / sent as f64) * 100.0 };
 
     LossStats {
         sent,
@@ -256,11 +284,12 @@ fn reorder_stats(samples: &[Sample]) -> ReorderStats {
 }
 
 fn dscp_stats(requested: u8, samples: &[Sample]) -> Option<DscpStats> {
-    // A reflector that did not echo DSCP reports 0 for every packet. Reporting
-    // "0% conformant" in that case would look like a catastrophic QoS failure
-    // when in fact we simply have no data — unless 0 (BE) is what we asked for.
-    let echoed: Vec<u8> = samples.iter().map(|s| s.rx_dscp).collect();
-    if echoed.is_empty() || (requested != 0 && echoed.iter().all(|&d| d == 0)) {
+    // Only samples where the peer actually reported a class. An all-zero set
+    // is now a real answer -- the path bleached the marking -- rather than an
+    // ambiguous one, because a peer that cannot observe DSCP says so instead
+    // of reporting zero.
+    let echoed: Vec<u8> = samples.iter().filter_map(|s| s.rx_dscp).collect();
+    if echoed.is_empty() {
         return None;
     }
 
@@ -316,10 +345,10 @@ mod tests {
     fn sample(seq: u32, rtt_us: u64, arrival: u32) -> Sample {
         Sample {
             seq,
-            reflector_seq: seq,
+            reflector_seq: Some(seq),
             rtt_ns: rtt_us * 1_000,
             tx_dscp: 46,
-            rx_dscp: 46,
+            rx_dscp: Some(46),
             arrival_index: arrival,
         }
     }
@@ -394,10 +423,10 @@ mod tests {
         // The reflector generated 10 replies (reflector_seq 0..9) but only 8
         // reached us — so 2 died on the return path, not the forward path.
         let samples: Vec<Sample> = (0..8)
-            .map(|i| Sample { reflector_seq: i, ..sample(i, 10_000, i) })
+            .map(|i| Sample { reflector_seq: Some(i), ..sample(i, 10_000, i) })
             .chain(std::iter::once(Sample {
                 seq: 9,
-                reflector_seq: 9,
+                reflector_seq: Some(9),
                 ..sample(9, 10_000, 8)
             }))
             .collect();
@@ -406,6 +435,35 @@ mod tests {
         assert_eq!(l.received, 9);
         assert_eq!(l.reverse_lost, 1);
         assert_eq!(l.forward_lost, 0);
+    }
+
+    #[test]
+    fn a_protocol_that_cannot_attribute_direction_reports_undetermined() {
+        // TWAMP-Light: the responder's counter spans every peer, so gaps mean
+        // nothing about this sender's return path. Attributing them would have
+        // reported heavy reverse loss on a perfectly healthy path.
+        let samples: Vec<Sample> = (0..8)
+            .map(|i| Sample { reflector_seq: None, ..sample(i, 10_000, i) })
+            .collect();
+        let l = summarise(10, &samples, None).loss;
+
+        assert_eq!(l.unknown_direction, 2);
+        assert_eq!(l.forward_lost, 0);
+        assert_eq!(l.reverse_lost, 0);
+        assert_eq!(l.loss_pct, 20.0, "the loss figure itself is still correct");
+    }
+
+    #[test]
+    fn interleaved_counters_would_have_faked_reverse_loss() {
+        // The concrete failure: a shared upstream answering two customers. This
+        // sender got every packet back, but the counter jumped because someone
+        // else's replies consumed values in between.
+        let samples: Vec<Sample> = (0..5)
+            .map(|i| Sample { reflector_seq: None, ..sample(i, 10_000, i) })
+            .collect();
+        let l = summarise(5, &samples, None).loss;
+        assert_eq!(l.loss_pct, 0.0);
+        assert_eq!(l.reverse_lost, 0, "a healthy path must not report reverse loss");
     }
 
     #[test]
@@ -434,7 +492,7 @@ mod tests {
     fn dscp_remarking_shows_up_as_non_conformance() {
         // Asked for EF (46); half the path bleached it to best-effort.
         let samples: Vec<Sample> = (0..10)
-            .map(|i| Sample { rx_dscp: if i < 5 { 46 } else { 0 }, ..sample(i, 10_000, i) })
+            .map(|i| Sample { rx_dscp: Some(if i < 5 { 46 } else { 0 }), ..sample(i, 10_000, i) })
             .collect();
         let d = summarise(10, &samples, Some(46)).dscp.unwrap();
         assert_eq!(d.conformant_pct, 50.0);
@@ -442,12 +500,26 @@ mod tests {
     }
 
     #[test]
-    fn missing_dscp_echo_reports_nothing_rather_than_zero_percent() {
-        // A reflector that does not echo DSCP returns 0 for every packet.
-        // Calling that "0% conformant" would read as a total QoS failure.
+    fn a_peer_that_cannot_report_dscp_yields_no_figure() {
+        // TWAMP, or a kernel that withheld the control message. Calling that
+        // "0% conformant" would read as a total QoS failure.
         let samples: Vec<Sample> =
-            (0..10).map(|i| Sample { rx_dscp: 0, ..sample(i, 10_000, i) }).collect();
+            (0..10).map(|i| Sample { rx_dscp: None, ..sample(i, 10_000, i) }).collect();
         assert!(summarise(10, &samples, Some(46)).dscp.is_none());
+    }
+
+    #[test]
+    fn a_path_that_bleaches_the_marking_is_reported_as_zero_percent() {
+        // The real case, measured toward an upstream POP: the reflector saw
+        // every packet arrive as best-effort. That is the single most useful
+        // thing this metric can tell an operator, and the old heuristic hid it
+        // behind "not echoed by peer".
+        let samples: Vec<Sample> =
+            (0..10).map(|i| Sample { rx_dscp: Some(0), ..sample(i, 10_000, i) }).collect();
+        let d = summarise(10, &samples, Some(46)).dscp.expect("bleaching must be reported");
+        assert_eq!(d.conformant_pct, 0.0);
+        assert_eq!(d.observed_mode, 0, "everything arrived best-effort");
+        assert_eq!(d.requested, 46);
     }
 
     #[test]
@@ -455,7 +527,7 @@ mod tests {
         // The converse: if we asked for DSCP 0, an all-zero echo is a real
         // 100% conformant result, not missing data.
         let samples: Vec<Sample> = (0..10)
-            .map(|i| Sample { tx_dscp: 0, rx_dscp: 0, ..sample(i, 10_000, i) })
+            .map(|i| Sample { tx_dscp: 0, rx_dscp: Some(0), ..sample(i, 10_000, i) })
             .collect();
         let d = summarise(10, &samples, Some(0)).dscp.unwrap();
         assert_eq!(d.conformant_pct, 100.0);

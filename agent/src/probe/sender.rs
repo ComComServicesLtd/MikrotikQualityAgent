@@ -244,12 +244,16 @@ fn accept_reply(
 
     Some(Sample {
         seq: h.seq,
-        reflector_seq: h.reflector_seq,
+        reflector_seq: Some(h.reflector_seq),
         rtt_ns,
         tx_dscp: requested_dscp,
         // The reflector's observation of what arrived at *its* end. `meta.dscp`
-        // is what came back to us on the return path — a different question.
-        rx_dscp: h.rx_dscp,
+        // is what came back on the return path, a different question.
+        //
+        // A non-zero forward TTL proves the reflector's control-message path
+        // works -- both fields come from the same mechanism -- so a zero DSCP
+        // alongside it means the packet really did arrive best-effort.
+        rx_dscp: if h.ttl_fwd > 0 { Some(h.rx_dscp) } else { None },
         arrival_index,
     })
     .inspect(|_| {

@@ -39,9 +39,11 @@ USAGE:
     mqagent --help
 
 REFLECT OPTIONS:
-    --port <PORT>        Listen port                        [default: 5301]
+    --port <PORT>        MQP listen port                    [default: 5301]
     --session <HEX>      Session ID to accept               [default: 1]
     --peer <IP>          Only accept from this address      [default: any]
+    --twamp-port <PORT>  Also answer TWAMP-Light here (separate socket)
+    --twamp-peer <IP>    Source permitted to TWAMP; repeatable
 
 PROBE OPTIONS:
     --peer <IP[:PORT]>   Target reflector                   [required]
@@ -161,6 +163,15 @@ pub struct ReflectArgs {
     pub port: u16,
     pub session: u64,
     pub peer: Option<std::net::IpAddr>,
+    /// When set, a TWAMP-Light responder runs alongside the MQP reflector on
+    /// this port.
+    ///
+    /// One container then answers both our own mesh and third parties. They
+    /// cannot share a socket: MQP's magic and a TWAMP sequence number can
+    /// collide, and a packet matching both would be parsed as whichever was
+    /// tried first.
+    pub twamp_port: Option<u16>,
+    pub twamp_peers: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -224,6 +235,15 @@ where
                 }
                 _ => None,
             },
+            // Setting MQ_TWAMP_PORT alongside reflect mode is how one
+            // container comes to answer both protocols on a router.
+            twamp_port: match get("MQ_TWAMP_PORT") {
+                Some(v) if !v.trim().is_empty() => Some(
+                    v.trim().parse().map_err(|_| format!("MQ_TWAMP_PORT {v:?} is not a port"))?,
+                ),
+                _ => None,
+            },
+            twamp_peers: twamp_peers(&get)?,
         })),
         "probe" => {
             let peer = get("MQ_PEER").ok_or("MQ_MODE=probe requires MQ_PEER")?;
@@ -254,23 +274,31 @@ where
         // that might run on a router has to be reachable from the environment.
         "twamp-reflect" => Ok(Command::TwampReflect(TwampReflectArgs {
             port: num(get("MQ_TWAMP_PORT").as_deref(), 862, "MQ_TWAMP_PORT")?,
-            peers: match get("MQ_TWAMP_PEERS") {
-                Some(v) if !v.trim().is_empty() => v
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(|p| {
-                        p.parse::<std::net::IpAddr>()
-                            .map_err(|_| format!("MQ_TWAMP_PEERS entry {p:?} is not an IP"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                _ => vec![],
-            },
+            peers: twamp_peers(&get)?,
         })),
         other => Err(format!(
             "MQ_MODE {other:?} is not one of: agent, reflect, probe, twamp-reflect"
         )),
     })())
+}
+
+/// Parse the comma-separated TWAMP allow-list from the environment.
+fn twamp_peers<F>(get: &F) -> Result<Vec<std::net::IpAddr>, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match get("MQ_TWAMP_PEERS") {
+        Some(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                p.parse::<std::net::IpAddr>()
+                    .map_err(|_| format!("MQ_TWAMP_PEERS entry {p:?} is not an IP"))
+            })
+            .collect(),
+        _ => Ok(vec![]),
+    }
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
@@ -306,6 +334,20 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 Some(p) => Some(p.parse().map_err(|_| format!("--peer {p:?} is not an IP"))?),
                 None => None,
             },
+            twamp_port: match get("twamp-port") {
+                Some(v) => Some(
+                    v.parse().map_err(|_| format!("--twamp-port {v:?} is not a port"))?,
+                ),
+                None => None,
+            },
+            twamp_peers: kv
+                .iter()
+                .filter(|(k, _)| k == "twamp-peer")
+                .map(|(_, v)| {
+                    v.parse::<std::net::IpAddr>()
+                        .map_err(|_| format!("--twamp-peer {v:?} is not an IP"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         })),
         "probe" => {
             let peer = get("peer").ok_or("probe requires --peer")?;
@@ -475,16 +517,43 @@ pub async fn run_reflect(args: ReflectArgs) -> anyhow::Result<()> {
     };
     registry.lock().await.grant(args.session, peer_filter);
 
-    eprintln!("reflector listening on {actual}");
+    eprintln!("MQP reflector listening on {actual}");
     eprintln!("session {:016x} granted to {}", args.session,
         args.peer.map(|p| p.to_string()).unwrap_or_else(|| "any address".into()));
-    eprintln!("press Ctrl-C to stop");
 
     let (tx, rx) = watch::channel(false);
-    let task = tokio::spawn(reflector.run(rx));
+    let mut tasks = vec![tokio::spawn(reflector.run(rx.clone()))];
+
+    // A second socket, not a second process: MQP's magic and a TWAMP sequence
+    // number can collide, so they cannot share a port.
+    if let Some(tport) = args.twamp_port {
+        use crate::probe::twamp::{AllowList, TwampReflector};
+
+        let mut allow =
+            if args.twamp_peers.is_empty() { AllowList::open() } else { AllowList::new() };
+        for p in &args.twamp_peers {
+            allow.allow(*p);
+        }
+        let tbind: SocketAddr = ([0, 0, 0, 0], tport).into();
+        let tr = TwampReflector::bind(tbind, Arc::new(Mutex::new(allow)))
+            .await
+            .map_err(|e| anyhow::anyhow!("could not bind {tbind}: {e}{}", port_hint(tport)))?;
+        eprintln!("TWAMP-Light responder listening on {}", tr.local_addr()?);
+        if args.twamp_peers.is_empty() {
+            eprintln!("WARNING: TWAMP answering any source — restrict with --twamp-peer");
+        } else {
+            eprintln!("TWAMP answering: {}", args.twamp_peers.iter().map(|p| p.to_string())
+                .collect::<Vec<_>>().join(", "));
+        }
+        tasks.push(tokio::spawn(tr.run(rx)));
+    }
+
+    eprintln!("press Ctrl-C to stop");
     tokio::signal::ctrl_c().await?;
     let _ = tx.send(true);
-    let _ = task.await;
+    for t in tasks {
+        let _ = t.await;
+    }
     Ok(())
 }
 
@@ -660,6 +729,46 @@ mod tests {
         // misconfiguration that only shows up as "no measurements".
         let err = from_env(env(&[("MQ_MODE", "reflct")])).unwrap().unwrap_err();
         assert!(err.contains("not one of"), "got {err}");
+    }
+
+    #[test]
+    fn reflect_mode_can_run_both_protocols_from_the_environment() {
+        // One container answering our own mesh and third parties at once, which
+        // is what restores DSCP conformance toward a shared upstream.
+        let c = from_env(env(&[
+            ("MQ_MODE", "reflect"),
+            ("MQ_PROBE_PORT", "5401"),
+            ("MQ_SESSION", "cafe"),
+            ("MQ_TWAMP_PORT", "862"),
+            ("MQ_TWAMP_PEERS", "162.216.190.1"),
+        ]))
+        .unwrap()
+        .unwrap();
+        let Command::Reflect(r) = c else { panic!("expected reflect") };
+        assert_eq!(r.port, 5401);
+        assert_eq!(r.twamp_port, Some(862), "TWAMP should run alongside MQP");
+        assert_eq!(r.twamp_peers.len(), 1);
+        assert_ne!(r.port, r.twamp_port.unwrap(), "they cannot share a socket");
+    }
+
+    #[test]
+    fn reflect_without_a_twamp_port_stays_mqp_only() {
+        let c = from_env(env(&[("MQ_MODE", "reflect")])).unwrap().unwrap();
+        let Command::Reflect(r) = c else { panic!("expected reflect") };
+        assert!(r.twamp_port.is_none());
+    }
+
+    #[test]
+    fn reflect_accepts_both_protocols_on_the_command_line() {
+        let Command::Reflect(r) = parse(argv(&[
+            "reflect", "--port", "5401", "--twamp-port", "862",
+            "--twamp-peer", "10.0.0.1", "--twamp-peer", "10.0.0.2",
+        ]))
+        .unwrap() else {
+            panic!("expected reflect")
+        };
+        assert_eq!(r.twamp_port, Some(862));
+        assert_eq!(r.twamp_peers.len(), 2, "--twamp-peer must be repeatable");
     }
 
     #[test]

@@ -191,7 +191,8 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Operator API (groups, tokens, agents, membership, queries) | Implemented, tested |
 | Many-to-many group membership with roles | Implemented, verified with a shared upstream agent |
 | Dashboard (embedded + standalone) | Implemented, verified with live data |
-| TWAMP-Light (responder + sender) | Implemented, verified on armv7 hardware |
+| TWAMP-Light (responder + sender) | Implemented, verified on armv7 and arm64 hardware |
+| Combined MQP + TWAMP reflector | Implemented — one container answers both, on separate ports |
 
 The measurement loop is complete: the scheduler plans a group's mesh, agents
 lease paired sender/reflector tasks, run them, and results land in TimescaleDB.

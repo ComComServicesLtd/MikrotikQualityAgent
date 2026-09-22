@@ -114,7 +114,7 @@ other tooling.
 | **Loss** | Forward loss and reverse loss separated using `reflector_seq`: a gap in `seq` seen by the reflector is forward loss; a gap in `reflector_seq` seen by the sender is reverse loss. A plain "no reply" is ambiguous and is counted separately as `unknown_direction`. |
 | **Reordering** | Per **RFC 4737** — a packet is reordered if its `seq` is lower than the highest `seq` already received. Reported as a ratio plus max displacement. |
 | **Duplication** | Count of `seq` values received more than once. |
-| **DSCP conformance** | `tx_dscp` vs `rx_dscp` per packet. A mismatch means something on the path remarked or bleached the traffic — the single most useful signal for verifying QoS actually survives end to end. |
+| **DSCP conformance** | `tx_dscp` vs `rx_dscp` per packet. A mismatch means something on the path remarked or bleached the traffic — the single most useful signal for verifying QoS actually survives end to end. A peer that cannot observe the class says so; **all-zero is a result, not an absence**, and means the marking was bleached. The two are told apart by `ttl_fwd`: both fields come from the same control-message mechanism, so a non-zero TTL proves a zero DSCP was genuinely observed. |
 | **MOS / R-factor** | ITU-T **G.107** E-model, computed from avg RTT, jitter and loss. See [`docs/architecture.md`](architecture.md). |
 
 ---
