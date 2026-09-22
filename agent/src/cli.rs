@@ -31,6 +31,7 @@ USAGE:
     mqagent                        Run as a managed agent (requires MQ_* env vars)
     mqagent reflect [OPTIONS]      Standalone reflector, no controller needed
     mqagent probe   [OPTIONS]      Standalone sender, no controller needed
+    mqagent discover [OPTIONS]     Survey the local network via a RouterOS device
     mqagent --help
 
 REFLECT OPTIONS:
@@ -49,8 +50,19 @@ PROBE OPTIONS:
     --codec <NAME>       g711|g711plc|g729|g722|opus for MOS [default: g711]
     --json               Emit JSON instead of a text report
 
+DISCOVER OPTIONS:
+    --host <IP>          RouterOS device to survey             [required]
+    --port <PORT>        REST port                  [default: 80, or 443 with --tls]
+    --user <NAME>        RouterOS username                     [default: admin]
+    --pass <SECRET>      RouterOS password                     [default: empty]
+    --tls                Use HTTPS (accepts self-signed certs)
+    --json               Emit JSON instead of a report
+
 EXAMPLE — measure the path to a router running `mqagent reflect`:
     mqagent probe --peer 172.16.220.138 --session cafe --count 300 --dscp 46
+
+EXAMPLE — find out why a site is slow:
+    mqagent discover --host 172.16.220.1 --user claude
 ";
 
 #[derive(Debug, PartialEq)]
@@ -59,6 +71,17 @@ pub enum Command {
     Help,
     Reflect(ReflectArgs),
     Probe(Box<ProbeArgs>),
+    Discover(Box<DiscoverArgs>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DiscoverArgs {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub pass: String,
+    pub tls: bool,
+    pub json: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -175,7 +198,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
         let Some(key) = tok.strip_prefix("--") else {
             return Err(format!("unexpected argument {tok:?}"));
         };
-        if key == "json" {
+        if key == "json" || key == "tls" {
             flags.push(key.to_string());
             continue;
         }
@@ -225,6 +248,19 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 dscp,
                 timeout_ms: num(get("timeout"), 1000, "timeout")?,
                 codec: codec(get("codec"))?,
+                json: flags.iter().any(|f| f == "json"),
+            })))
+        }
+        "discover" => {
+            let tls = flags.iter().any(|f| f == "tls");
+            Ok(Command::Discover(Box::new(DiscoverArgs {
+                host: get("host").ok_or("discover requires --host")?.to_string(),
+                port: num(get("port"), if tls { 443 } else { 80 }, "port")?,
+                user: get("user").unwrap_or("admin").to_string(),
+                // A blank password is normal on lab and factory-default
+                // routers, so an absent --pass means empty, not an error.
+                pass: get("pass").unwrap_or("").to_string(),
+                tls,
                 json: flags.iter().any(|f| f == "json"),
             })))
         }
@@ -585,4 +621,88 @@ mod tests {
             assert_eq!(p.codec, want, "codec {name}");
         }
     }
+}
+
+/// Survey a RouterOS device and report what is wrong with the local network.
+pub async fn run_discover(args: DiscoverArgs) -> anyhow::Result<()> {
+    use crate::discovery::{collect, findings};
+    use crate::routeros::RouterOs;
+
+    let ros = RouterOs::new(
+        &args.host,
+        args.port,
+        &args.user,
+        &args.pass,
+        args.tls,
+        Duration::from_secs(20),
+    )?;
+
+    let identity = ros.check().await?;
+    if !args.json {
+        eprintln!("surveying {} ({}:{})", identity, args.host, args.port);
+    }
+
+    let snap = collect::run(&ros).await;
+    let found = findings::analyse(&snap);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "router": identity,
+                "host": args.host,
+                "inventory": {
+                    "wifi_clients": snap.clients.len(),
+                    "radios": snap.radios.len(),
+                    "arp_entries": snap.arp.len(),
+                    "dhcp_leases": snap.leases.len(),
+                    "interfaces": snap.interfaces.len(),
+                    "dhcp_pool_size": snap.dhcp_pool_size,
+                },
+                "findings": found,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!();
+    println!("Inventory");
+    println!("  wifi clients   {}", snap.clients.len());
+    println!("  radios         {}", snap.radios.len());
+    println!("  ARP entries    {}", snap.arp.len());
+    println!("  DHCP leases    {}{}", snap.leases.len(),
+        snap.dhcp_pool_size.map(|p| format!(" of {p} pool addresses")).unwrap_or_default());
+    println!("  interfaces     {}", snap.interfaces.len());
+
+    for r in &snap.radios {
+        println!("  radio {:8} {} {} {}", r.name, r.band, r.width,
+            r.frequency_mhz.map(|f| format!("{f} MHz")).unwrap_or_default());
+    }
+    for c in &snap.clients {
+        println!(
+            "  client {} {:>5} dBm  tx {:>4} Mbit/s  rx {:>4} Mbit/s  {}",
+            c.mac, c.signal_dbm, c.tx_rate_bps / 1_000_000, c.rx_rate_bps / 1_000_000, c.ssid
+        );
+    }
+
+    println!();
+    if found.is_empty() {
+        println!("No problems found.");
+        return Ok(());
+    }
+
+    println!("Findings ({})", found.len());
+    for f in &found {
+        let tag = match f.severity {
+            findings::Severity::Critical => "CRITICAL",
+            findings::Severity::Warning => "WARNING ",
+            findings::Severity::Info => "INFO    ",
+        };
+        println!("\n  [{tag}] {}", f.code);
+        println!("  {}", f.summary);
+        for e in &f.evidence {
+            println!("    · {e}");
+        }
+    }
+    Ok(())
 }

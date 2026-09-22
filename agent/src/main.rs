@@ -52,6 +52,7 @@ fn main() -> ExitCode {
         // control plane exists.
         cli::Command::Reflect(args) => standalone(cli::run_reflect(args)),
         cli::Command::Probe(args) => standalone(cli::run_probe(*args)),
+        cli::Command::Discover(args) => standalone(cli::run_discover(*args)),
         cli::Command::Agent => run_managed(),
     }
 }

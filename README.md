@@ -95,6 +95,24 @@ Voice     MOS 4.41  R-factor 93.2  (G711, 60 ms effective delay)
 `--json` emits the same data as machine-readable output. The process exits
 non-zero when nothing came back, so it drops into a monitoring script.
 
+### Network discovery
+
+The agent can survey a RouterOS device and explain what is wrong with the local
+network, rather than just inventorying it:
+
+```bash
+mqagent discover --host 172.16.220.1 --user claude
+```
+
+It reads ARP, DHCP leases, wireless registrations, radios and interface
+counters, then reduces them to ranked findings — slow clients eating shared
+airtime, coverage gaps, co-channel contention, broadcast storms, duplicate
+addresses, DHCP pool pressure. `--json` for machine consumption.
+
+Both RouterOS wireless stacks are handled: the hAP ac³ answers on legacy
+`/interface/wireless`, the hAP ax³ returns 400 for it and answers on
+`/interface/wifi`. One build covers a mixed fleet.
+
 ### Tests
 
 ```bash
@@ -119,6 +137,8 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Agent controller client | Not yet — agent runs reflector-only |
 | RouterOS bandwidth-test offload | Not yet |
 | TWAMP-Light interop | Not yet |
+| Network discovery (wifi, ARP, DHCP, storms) | Implemented, verified against a live router |
+| Discovery: traceroute, ip-scan, pcap collectors | Not yet — API verified, not wired |
 
 The two gaps that matter for an end-to-end run are the **mesh scheduler** (the
 controller stores and hands out tasks, but nothing creates them yet) and the
