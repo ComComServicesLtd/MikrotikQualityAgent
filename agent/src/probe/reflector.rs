@@ -28,9 +28,25 @@ struct Session {
     /// Increments once per reply generated. The sender uses gaps in this to
     /// tell reverse-path loss from forward-path loss.
     reflector_seq: u32,
-    /// Only this peer may use this session ID.
+    /// Only this peer may use this session ID. An unspecified address
+    /// (`0.0.0.0` / `::`) is a wildcard — see [`Session::accepts`].
     peer: SocketAddr,
     packets: u64,
+}
+
+impl Session {
+    /// Whether a packet from `from` may use this session.
+    ///
+    /// Matching is on address only, never port: the sender's source port is
+    /// ephemeral and the controller cannot know it when it issues the grant.
+    ///
+    /// An unspecified bind address is treated as "any source". The controller
+    /// always names a real peer, so this only applies to the standalone
+    /// `reflect` test mode, where the sender's address is not known up front.
+    /// The session ID remains required either way.
+    fn accepts(&self, from: SocketAddr) -> bool {
+        self.peer.ip().is_unspecified() || self.peer.ip() == from.ip()
+    }
 }
 
 /// Grants issued by the controller, keyed by session ID.
@@ -145,7 +161,7 @@ impl Reflector {
         let (reflector_seq, authorised) = {
             let mut reg = self.registry.lock().await;
             match reg.sessions.get_mut(&header.session_id) {
-                Some(s) if s.peer.ip() == peer.ip() => {
+                Some(s) if s.accepts(peer) => {
                     let seq = s.reflector_seq;
                     s.reflector_seq = s.reflector_seq.wrapping_add(1);
                     s.packets += 1;
@@ -270,6 +286,48 @@ mod tests {
         assert!(reply.t2 > 0, "reflector must stamp arrival");
         assert!(reply.t3 >= reply.t2, "departure cannot precede arrival");
         assert_eq!(reply.rx_dscp, 46, "reflector must echo the DSCP it observed");
+    }
+
+    #[tokio::test]
+    async fn wildcard_grant_accepts_any_source_address() {
+        // The standalone `reflect` mode cannot know the sender's address in
+        // advance, so it grants 0.0.0.0. Without wildcard handling the
+        // reflector compares 0.0.0.0 against the real source, rejects every
+        // packet, and the run reports 100% loss on a perfectly healthy path.
+        let (addr, registry, _sd) = spawn_reflector().await;
+        let client = socket::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        registry.lock().await.grant(0xF00D, "0.0.0.0:0".parse().unwrap());
+
+        client.send_to(&request(0xF00D, 1), addr).await.unwrap();
+
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let (n, _, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            socket::recv_from_with_meta(&client, &mut buf),
+        )
+        .await
+        .expect("wildcard grant should have been reflected")
+        .unwrap();
+        assert_eq!(Header::decode(&buf[..n]).unwrap().seq, 1);
+    }
+
+    #[tokio::test]
+    async fn specific_grant_still_rejects_a_different_source() {
+        // The wildcard must not have weakened normal admission control.
+        let (addr, registry, _sd) = spawn_reflector().await;
+        let client = socket::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        // Grant a different address than the one we will send from.
+        registry.lock().await.grant(0xBEEF, "203.0.113.99:5301".parse().unwrap());
+
+        client.send_to(&request(0xBEEF, 0), addr).await.unwrap();
+
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let res = tokio::time::timeout(
+            Duration::from_millis(300),
+            socket::recv_from_with_meta(&client, &mut buf),
+        )
+        .await;
+        assert!(res.is_err(), "a grant for another address must not be usable");
     }
 
     #[tokio::test]

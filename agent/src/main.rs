@@ -12,10 +12,58 @@ use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use mqagent::cli;
 use mqagent::config::Config;
 use mqagent::probe::reflector::{Reflector, Registry};
 
 fn main() -> ExitCode {
+    let command = match cli::parse(std::env::args()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}\n");
+            eprintln!("{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+
+    match command {
+        cli::Command::Help => {
+            println!("{}", cli::USAGE);
+            ExitCode::SUCCESS
+        }
+        // Standalone modes take an explicit session ID and need no controller,
+        // so the data plane can be exercised against real hardware before the
+        // control plane exists.
+        cli::Command::Reflect(args) => standalone(cli::run_reflect(args)),
+        cli::Command::Probe(args) => standalone(cli::run_probe(*args)),
+        cli::Command::Agent => run_managed(),
+    }
+}
+
+/// Run a one-shot sub-command on a small runtime.
+fn standalone<F>(fut: F) -> ExitCode
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    init_logging(&std::env::var("MQ_LOG").unwrap_or_else(|_| "warn".into()));
+
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(fut) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_managed() -> ExitCode {
     // Config is read before the runtime starts so a misconfiguration fails
     // instantly with a clear message, rather than after a tokio backtrace.
     let cfg = match Config::from_env() {

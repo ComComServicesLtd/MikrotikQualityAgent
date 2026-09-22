@@ -64,6 +64,37 @@ catch everyone out:
 2. The image must be a `docker save` archive built with
    `--output=type=docker`. `docker export` output will not import.
 
+### Measuring a path without a controller
+
+The agent's managed mode only answers sessions a controller has granted. To
+exercise a real path before the control plane exists, both halves can run
+standalone with a shared session ID.
+
+On the far end:
+
+```bash
+mqagent reflect --session cafe --port 5301
+```
+
+From the near end:
+
+```bash
+mqagent probe --peer 172.16.220.138 --session cafe --count 300 --dscp 46
+```
+
+```
+RTT       min 0.041 ms  avg 0.120 ms  max 1.058 ms  stddev 0.136 ms
+          p50 0.086 ms  p95 0.226 ms  p99 1.058 ms
+Jitter    IPDV avg 0.060 ms  PDV p95 0.140 ms
+Loss      0/60 lost (0.00%)
+Order     0 reordered (max displacement 0)  0 duplicated
+DSCP      requested 46  observed 46  conformant 100.0%
+Voice     MOS 4.41  R-factor 93.2  (G711, 60 ms effective delay)
+```
+
+`--json` emits the same data as machine-readable output. The process exits
+non-zero when nothing came back, so it drops into a monitoring script.
+
 ### Tests
 
 ```bash
