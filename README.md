@@ -215,6 +215,7 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Discovery: traceroute + ip-scan | Implemented, verified against a live router |
 | Discovery: packet + 802.11 capture | Implemented — names the host, not just the interface |
 | Operator API (groups, tokens, agents, membership, queries) | Implemented, tested |
+| One-shot tests (`POST /tests`) + agent executors | Implemented, verified end to end |
 | Many-to-many group membership with roles | Implemented, verified with a shared upstream agent |
 | Dashboard (embedded + standalone) | Implemented, verified with live data |
 | TWAMP-Light (responder + sender) | Implemented, verified on armv7 and arm64 hardware |

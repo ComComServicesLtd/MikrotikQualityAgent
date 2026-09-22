@@ -50,6 +50,7 @@ func (s *Server) Routes() http.Handler {
 
 	mux.Handle("GET /api/v1/agents", s.operatorAuth(s.handleListAgents))
 	s.operatorRoutes(mux)
+	s.testRoutes(mux)
 	if s.ui {
 		s.uiRoutes(mux)
 	}

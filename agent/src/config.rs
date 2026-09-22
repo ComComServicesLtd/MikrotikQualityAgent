@@ -183,8 +183,12 @@ impl Config {
         let username = get("MQ_ROUTEROS_USER")
             .filter(|v| !v.trim().is_empty())
             .ok_or(ConfigError::PartialRouterOs("MQ_ROUTEROS_USER"))?;
+        // Presence, not non-emptiness. A blank RouterOS password is normal on
+        // lab and factory-default routers -- which is exactly where this tool
+        // is most needed -- and the environment distinguishes "unset" from
+        // "set to empty" for us. Requiring a non-empty value made the agent
+        // refuse to start against the very devices it was written for.
         let password = get("MQ_ROUTEROS_PASS")
-            .filter(|v| !v.is_empty())
             .ok_or(ConfigError::PartialRouterOs("MQ_ROUTEROS_PASS"))?;
 
         let use_tls = parse_bool(get("MQ_ROUTEROS_TLS").as_deref(), false);
@@ -319,6 +323,21 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_routeros_password_is_accepted() {
+        // Lab and factory-default MikroTiks ship with one. Rejecting it made
+        // the agent refuse to start against the devices it exists to measure,
+        // while routeros.rs simultaneously asserted blank passwords work.
+        let mut m = base();
+        m.insert("MQ_ROUTEROS_HOST", "172.16.220.138");
+        m.insert("MQ_ROUTEROS_USER", "admin");
+        m.insert("MQ_ROUTEROS_PASS", "");
+
+        let ros = load(&m).unwrap().routeros.expect("blank password is a valid choice");
+        assert_eq!(ros.username, "admin");
+        assert!(ros.password.is_empty());
+    }
+
+    #[test]
     fn partial_routeros_credentials_are_rejected_loudly() {
         // The failure mode this prevents: the agent advertises the
         // bandwidth-test capability, gets scheduled throughput work, and then
@@ -327,6 +346,8 @@ mod tests {
         m.insert("MQ_ROUTEROS_HOST", "172.17.0.1");
         assert!(matches!(load(&m), Err(ConfigError::PartialRouterOs("MQ_ROUTEROS_USER"))));
 
+        // Omitting the variable entirely is still a mistake -- that is the
+        // half-configured case worth catching.
         m.insert("MQ_ROUTEROS_USER", "btagent");
         assert!(matches!(load(&m), Err(ConfigError::PartialRouterOs("MQ_ROUTEROS_PASS"))));
     }
@@ -405,5 +426,21 @@ mod tests {
         assert!(!parse_bool(Some("0"), true));
         assert!(parse_bool(None, true), "absent falls back to the default");
         assert!(parse_bool(Some("banana"), true), "unrecognised falls back too");
+    }
+}
+
+impl RouterOsConfig {
+    /// Port for the REST API.
+    ///
+    /// `port` configures the *binary* API, which the throughput offload wants
+    /// for its streaming. Discovery and one-shot diagnostics use REST, which
+    /// lives on the web service instead — a different port entirely, and
+    /// reusing 8728 there fails with a confusing connection error.
+    pub fn port_rest(&self) -> u16 {
+        if self.use_tls {
+            443
+        } else {
+            80
+        }
     }
 }

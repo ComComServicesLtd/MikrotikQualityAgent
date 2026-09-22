@@ -4,6 +4,7 @@
 package model
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -95,7 +96,39 @@ const (
 	// TaskWifiSignal reads wireless signal strength and registration data from
 	// the host router. Host telemetry, not a path measurement.
 	TaskWifiSignal TaskKind = "wifi_signal"
+	// TaskPacketCapture runs a short sniffer and reports who was talking.
+	TaskPacketCapture TaskKind = "packet_capture"
 )
+
+// NeedsPeer reports whether a kind measures between two agents. The rest take
+// a target address, or nothing at all — the distinction decides what a test
+// request must supply.
+func (k TaskKind) NeedsPeer() bool {
+	matches := k == TaskMQPProbe || k == TaskTwampProbe
+	return matches
+}
+
+// NeedsTarget reports whether a kind aims at an arbitrary address rather than
+// a peer agent.
+func (k TaskKind) NeedsTarget() bool {
+	switch k {
+	case TaskPathTrace, TaskRouterOSBtest, TaskTCPConnect:
+		return true
+	default:
+		return false
+	}
+}
+
+// NeedsRouterOS reports whether the agent must be able to reach its host
+// router's API to perform this kind.
+func (k TaskKind) NeedsRouterOS() bool {
+	switch k {
+	case TaskRouterOSBtest, TaskPathTrace, TaskWifiSignal, TaskPacketCapture:
+		return true
+	default:
+		return false
+	}
+}
 
 // Recurring reports whether this kind belongs to a group's continuous plan
 // rather than being an operator-issued one-shot.
@@ -123,7 +156,8 @@ const (
 	RoleReflector TaskRole = "reflector"
 )
 
-// ProbeParams are the knobs for one measurement.
+// ProbeParams documents the knobs a probe understands. It is descriptive, not
+// a wire type: see Task.Params.
 type ProbeParams struct {
 	Count        int    `json:"count,omitempty"`
 	IntervalMS   int    `json:"interval_ms,omitempty"`
@@ -148,12 +182,19 @@ type Task struct {
 	// SessionID is shared by the sender task and its reflector grant, and goes
 	// on the wire as MQP's session_id. It is the reflector's only admission
 	// control, so it must come from a CSPRNG.
-	SessionID      uint64      `json:"session_id,string"`
-	Kind           TaskKind    `json:"kind"`
-	Role           TaskRole    `json:"role"`
-	Peer           *PeerRef    `json:"peer,omitempty"`
-	Params         ProbeParams `json:"params"`
-	LeaseExpiresAt time.Time   `json:"lease_expires_at"`
+	SessionID uint64   `json:"session_id,string"`
+	Kind      TaskKind `json:"kind"`
+	Role      TaskRole `json:"role"`
+	Peer      *PeerRef `json:"peer,omitempty"`
+	// Opaque to the controller, which has no reason to interpret it.
+	//
+	// This was a typed struct, and that silently dropped every field the
+	// struct did not declare -- a one-shot traceroute's `target` among them,
+	// so the agent received a task with no destination and reported "carries
+	// no target". Only the agent needs to understand these, so they pass
+	// through unread.
+	Params         json.RawMessage `json:"params"`
+	LeaseExpiresAt time.Time       `json:"lease_expires_at"`
 	// Recurring marks this as part of the group's continuous plan, which the
 	// agent caches and keeps running when the controller is unreachable.
 	Recurring bool `json:"recurring"`
@@ -250,6 +291,10 @@ type Result struct {
 	DSCP       *DSCPStats       `json:"dscp,omitempty"`
 	MOS        *MOSStats        `json:"mos,omitempty"`
 	Throughput *ThroughputStats `json:"throughput,omitempty"`
+	/// Structured payload for a one-shot diagnostic -- hop list, capture
+	/// summary, wifi snapshot. Kept as raw JSON because each kind's shape
+	/// differs and the controller only needs to store and return it.
+	Extra json.RawMessage `json:"extra,omitempty"`
 }
 
 // Valid reports whether a submitted result is self-consistent. Rejecting

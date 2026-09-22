@@ -109,6 +109,7 @@ impl TaskDto {
             "routeros_btest" => plan::Kind::RouterOsBtest,
             "path_trace" => plan::Kind::PathTrace,
             "wifi_signal" => plan::Kind::WifiSignal,
+            "packet_capture" => plan::Kind::PacketCapture,
             other => {
                 return Err(ControllerError::Decode(format!("unknown task kind {other:?}")))
             }
@@ -309,6 +310,7 @@ mod tests {
             ("routeros_btest", plan::Kind::RouterOsBtest),
             ("path_trace", plan::Kind::PathTrace),
             ("wifi_signal", plan::Kind::WifiSignal),
+            ("packet_capture", plan::Kind::PacketCapture),
         ] {
             let (t, _) = dto(k, "sender", "51966").into_plan().unwrap();
             assert_eq!(t.kind, want, "kind {k}");

@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 
     kind         TEXT NOT NULL
                  CHECK (kind IN ('mqp_probe', 'twamp_probe', 'tcp_connect',
-                                 'routeros_btest', 'path_trace', 'wifi_signal')),
+                                 'routeros_btest', 'path_trace', 'wifi_signal',
+                                 'packet_capture')),
 
     -- Continuous plan work is cached by the agent and keeps running through a
     -- controller outage. One-shots expire instead: a stale diagnostic answers

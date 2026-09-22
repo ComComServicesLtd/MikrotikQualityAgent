@@ -30,6 +30,7 @@ pub enum Kind {
     RouterOsBtest,
     PathTrace,
     WifiSignal,
+    PacketCapture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

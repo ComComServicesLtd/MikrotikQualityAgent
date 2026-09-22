@@ -33,6 +33,31 @@ const SUBMIT_BATCH: usize = 100;
 /// wedged task from stalling the whole loop.
 const TASK_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Which host-router diagnostic a task is asking for.
+///
+/// All four run through the RouterOS API rather than from inside the
+/// container, because what they inspect — the path from the router, the
+/// router's forwarding hardware, the wire, the radio — is not visible from a
+/// veth.
+#[derive(Debug, Clone, Copy)]
+enum HostTask {
+    Trace,
+    Btest,
+    Capture,
+    WifiSignal,
+}
+
+impl HostTask {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Trace => "traceroute",
+            Self::Btest => "bandwidth test",
+            Self::Capture => "packet capture",
+            Self::WifiSignal => "wireless snapshot",
+        }
+    }
+}
+
 /// Outcome of checking a persisted identity against the controller.
 enum Verified {
     /// The stored credential still works.
@@ -49,6 +74,10 @@ pub struct Agent {
     plan: Plan,
     spool: Spool<serde_json::Value>,
     registry: Arc<Mutex<Registry>>,
+    /// Client for the *host* router, when credentials are configured. One-shot
+    /// diagnostics run through it; without it they are skipped with a reason
+    /// rather than failing silently.
+    ros: Option<crate::routeros::RouterOs>,
     started: Instant,
     last_error: Option<String>,
 }
@@ -145,6 +174,19 @@ impl Agent {
         identity: Identity,
         registry: Arc<Mutex<Registry>>,
     ) -> Self {
+        let ros = cfg.routeros.as_ref().and_then(|r| {
+            crate::routeros::RouterOs::new(
+                &r.host.to_string(),
+                r.port_rest(),
+                &r.username,
+                &r.password,
+                r.use_tls,
+                Duration::from_secs(90),
+            )
+            .map_err(|e| warn!(error = %e, "could not build a RouterOS client"))
+            .ok()
+        });
+
         Self {
             plan: Plan::new(Duration::from_secs(60)),
             spool: Spool::new(cfg.spool),
@@ -152,6 +194,7 @@ impl Agent {
             client,
             identity,
             registry,
+            ros,
             started: Instant::now(),
             last_error: None,
         }
@@ -347,6 +390,12 @@ impl Agent {
             // A reflector task is an authorisation, not an action: the grant
             // was installed at poll time and the reflector serves it.
             plan::Kind::MqpProbe => {}
+
+            plan::Kind::PathTrace => self.run_host_task(task, HostTask::Trace).await,
+            plan::Kind::RouterOsBtest => self.run_host_task(task, HostTask::Btest).await,
+            plan::Kind::PacketCapture => self.run_host_task(task, HostTask::Capture).await,
+            plan::Kind::WifiSignal => self.run_host_task(task, HostTask::WifiSignal).await,
+
             other => {
                 debug!(?other, task = %task.task_id, "task kind not implemented yet; skipping");
                 self.enqueue_skipped(&task, "task kind not implemented in this agent version");
@@ -419,6 +468,136 @@ impl Agent {
             Err(_) => self.failure_body(&task, started, ended, "task exceeded its time limit"),
         };
 
+        self.enqueue(body);
+    }
+
+    /// Run a one-shot diagnostic through the host router and spool the result.
+    async fn run_host_task(&mut self, task: plan::Task, which: HostTask) {
+        let Some(ros) = self.ros.as_ref() else {
+            // Configured absence, not a failure: the agent simply has no
+            // credentials for its host. Saying which ones are missing is more
+            // use than a generic error.
+            self.enqueue_skipped(
+                &task,
+                "no RouterOS credentials configured; set MQ_ROUTEROS_HOST/USER/PASS",
+            );
+            return;
+        };
+
+        let started = time::OffsetDateTime::now_utc();
+        // Annotated because the arms build their errors from several sources;
+        // without it the block's error type is ambiguous.
+        let outcome: Result<Result<serde_json::Value, String>, _> =
+            tokio::time::timeout(TASK_TIMEOUT, async {
+            match which {
+                HostTask::Trace => {
+                    let target = task
+                        .params
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "traceroute task carries no target".to_string())?;
+                    let count = task.params.get("count").and_then(|v| v.as_u64()).unwrap_or(3);
+                    let raw = ros
+                        .post(
+                            "/tool/traceroute",
+                            &serde_json::json!({
+                                "address": target, "count": count.to_string(), "timeout": "1",
+                            }),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    let hops = crate::discovery::tools::parse_traceroute(&raw);
+                    let findings = crate::discovery::tools::analyse_path(&hops, target);
+                    Ok(serde_json::json!({
+                        "target": target,
+                        "hops": hops.iter().map(|h| serde_json::json!({
+                            "ttl": h.ttl, "address": h.address, "avg_ms": h.avg_ms,
+                            "best_ms": h.best_ms, "worst_ms": h.worst_ms, "loss_pct": h.loss_pct,
+                        })).collect::<Vec<_>>(),
+                        "findings": findings,
+                    }))
+                }
+
+                HostTask::Btest => {
+                    use crate::routeros::btest::{self, BtestConfig, Direction, Protocol};
+                    let p = &task.params;
+                    let target = p
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "bandwidth test carries no target".to_string())?;
+                    let dir = Direction::parse(p.get("direction").and_then(|v| v.as_str()).unwrap_or("rx"))
+                        .ok_or_else(|| "direction must be rx, tx or both".to_string())?;
+                    let proto = Protocol::parse(p.get("protocol").and_then(|v| v.as_str()).unwrap_or("tcp"))
+                        .ok_or_else(|| "protocol must be tcp or udp".to_string())?;
+
+                    let mut cfg = BtestConfig::new(target, dir, proto);
+                    cfg.duration = Duration::from_secs(
+                        p.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(10),
+                    );
+                    cfg.user = p.get("bt_user").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    cfg.password =
+                        p.get("bt_pass").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                    let r = btest::run(ros, &cfg).await.map_err(|e| e.to_string())?;
+                    Ok(serde_json::to_value(&r).unwrap_or_default())
+                }
+
+                HostTask::Capture => {
+                    use crate::discovery::capture;
+                    let iface =
+                        task.params.get("interface").and_then(|v| v.as_str()).unwrap_or("");
+                    let secs =
+                        task.params.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(10);
+                    let wireless =
+                        task.params.get("wireless").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    let cap = if wireless {
+                        capture::run_wireless_capture(ros, iface, Duration::from_secs(secs), false)
+                            .await
+                    } else {
+                        capture::run_packet_capture(ros, iface, Duration::from_secs(secs)).await
+                    }
+                    .map_err(|e| e.to_string())?;
+
+                    let findings = capture::analyse(&cap);
+                    Ok(serde_json::json!({ "capture": cap, "findings": findings }))
+                }
+
+                HostTask::WifiSignal => {
+                    let snap = crate::discovery::collect::run(ros).await;
+                    let findings = crate::discovery::findings::analyse(&snap);
+                    Ok(serde_json::json!({
+                        "clients": snap.clients.len(),
+                        "radios": snap.radios.len(),
+                        "findings": findings,
+                    }))
+                }
+            }
+        })
+        .await;
+
+        let ended = time::OffsetDateTime::now_utc();
+        let body = match outcome {
+            Ok(Ok(extra)) => {
+                debug!(task = %task.task_id, kind = which.label(), "one-shot complete");
+                serde_json::json!({
+                    "task_id": task.task_id,
+                    "session_id": task.session_id.to_string(),
+                    "started_at": rfc3339(started),
+                    "ended_at": rfc3339(ended),
+                    "status": "ok",
+                    "extra": extra,
+                })
+            }
+            Ok(Err(e)) => self.failure_body(&task, started, ended, &e),
+            Err(_) => self.failure_body(
+                &task,
+                started,
+                ended,
+                &format!("{} exceeded its time limit", which.label()),
+            ),
+        };
         self.enqueue(body);
     }
 

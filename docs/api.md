@@ -166,9 +166,48 @@ drain its spool.
 | `DELETE` | `/agents/{id}` | Deregister; revokes the agent token. |
 | `GET`/`POST` | `/groups` | List / create groups. |
 | `PUT`  | `/groups/{name}/plan` | Set the mesh plan (`full`, `ring`, `hub`, `partial`) and cadence. |
-| `POST` | `/tests` | Schedule a one-off test between named agents. |
+| `POST` | `/tests` | Queue a one-shot diagnostic. See below. |
+| `GET`  | `/tests/{task_id}` | Its state, and its result once the agent reports. |
 | `GET`  | `/results` | Query results. `group`, `agent`, `peer`, `from`, `to`, `kind`, plus `rollup=raw\|1m\|5m\|1h`. |
 | `GET`  | `/healthz` · `/readyz` | Liveness and readiness. Unauthenticated. |
+
+## One-shot tests
+
+```jsonc
+// POST /api/v1/tests
+{
+  "agent":  "yvr-branch-01",     // name or UUID
+  "kind":   "path_trace",
+  "target": "1.1.1.1",           // kinds that aim at an address
+  "peer":   "cal-branch-02",     // kinds that measure between two agents
+  "params": { "count": 3 },
+  "expires_in_s": 300
+}
+
+// 201
+{ "task_id": "o:path_trace:…", "state": "pending", "expires_at": "…" }
+```
+
+Which of `target` and `peer` applies depends on the kind:
+
+| Kind | Needs |
+|---|---|
+| `mqp_probe`, `twamp_probe` | `peer` — a reflector must exist at the far end |
+| `path_trace`, `routeros_btest`, `tcp_connect` | `target` — any address |
+| `wifi_signal`, `packet_capture` | neither — they inspect the agent's own host |
+
+The request is **refused up front** when the agent cannot perform the kind —
+disabled, stale, or without the RouterOS credentials the kind needs. Queueing
+it instead would leave an operator waiting minutes for a result that only says
+`skipped`.
+
+One-shots expire, by default after 5 minutes and at most an hour. A diagnostic
+answers a question somebody is asking now; run later it describes a moment that
+has passed. An expired test is reported `skipped`, never run late.
+
+`GET /tests/{task_id}` returns the task and, once the agent has reported, the
+result — with the kind's structured payload under `extra` (hop list, capture
+summary, throughput figures and their CPU verdict).
 
 ## Conventions
 

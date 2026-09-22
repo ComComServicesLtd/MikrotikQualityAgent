@@ -318,6 +318,8 @@ func (s *Store) LeaseTasks(ctx context.Context, agentID uuid.UUID, lease time.Du
 		var peerID *uuid.UUID
 		if err := rows.Scan(&t.TaskID, &sessionID, &t.Kind, &t.Role,
 			&peerID, &t.Params, &t.LeaseExpiresAt); err != nil {
+			// params is JSONB and lands in a RawMessage unchanged, so whatever
+			// the scheduler or an operator put there reaches the agent intact.
 			return nil, err
 		}
 		// session_id is stored signed because Postgres has no unsigned 64-bit
@@ -434,7 +436,7 @@ func (s *Store) SaveResult(ctx context.Context, agentID uuid.UUID, group string,
 			reordered, max_displacement, duplicated,
 			dscp_requested, dscp_observed, dscp_conformant_pct,
 			mos_codec, r_factor, mos,
-			tx_bps, rx_bps, throughput_source, local_cpu_load, remote_cpu_load)
+			tx_bps, rx_bps, throughput_source, local_cpu_load, remote_cpu_load, extra)
 		VALUES (
 			$1, $2, $3, $4, $5, $6, $7,
 			$8, $9, $10, $11,
@@ -444,7 +446,7 @@ func (s *Store) SaveResult(ctx context.Context, agentID uuid.UUID, group string,
 			$27, $28, $29,
 			$30, $31, $32,
 			$33, $34, $35,
-			$36, $37, $38, $39, $40)
+			$36, $37, $38, $39, $40, $41)
 		ON CONFLICT (task_id, time) DO NOTHING`,
 		r.EndedAt, r.TaskID, int64(r.SessionID), agentID, peerID, group, kind,
 		string(r.Status), r.Error, r.StartedAt, r.EndedAt,
@@ -477,6 +479,7 @@ func (s *Store) SaveResult(ctx context.Context, agentID uuid.UUID, group string,
 		v(r.Throughput, func(x model.ThroughputStats) any { return x.Source }),
 		v(r.Throughput, func(x model.ThroughputStats) any { return x.LocalCPULoad }),
 		v(r.Throughput, func(x model.ThroughputStats) any { return x.RemoteCPULoad }),
+		extraOrEmpty(r.Extra),
 	)
 	if err != nil {
 		return false, err
@@ -499,6 +502,15 @@ func v[T any](p *T, f func(T) any) any {
 		return nil
 	}
 	return f(*p)
+}
+
+// extraOrEmpty keeps the column non-null, since the schema defaults it to an
+// empty object and a null would break consumers expecting one.
+func extraOrEmpty(raw []byte) any {
+	if len(raw) == 0 {
+		return "{}"
+	}
+	return string(raw)
 }
 
 func nullIfEmpty(s string) any {

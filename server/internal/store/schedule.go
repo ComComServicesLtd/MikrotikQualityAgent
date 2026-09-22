@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -193,4 +195,172 @@ func (s *Store) PurgeCompletedTasks(ctx context.Context, olderThan time.Duration
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// --- one-shot tests -------------------------------------------------------
+
+// OneShotRequest is an operator-issued diagnostic.
+type OneShotRequest struct {
+	AgentID   uuid.UUID
+	PeerID    *uuid.UUID
+	Kind      model.TaskKind
+	Params    map[string]any
+	Group     string
+	ExpiresIn time.Duration
+}
+
+// CreateOneShot writes a single non-recurring task, plus the matching
+// reflector grant when the kind measures between two agents.
+//
+// The id carries a random suffix rather than being derived from the pair and a
+// cycle like mesh work: two operators asking for the same traceroute a minute
+// apart both want an answer, so these must not collide and silently become one.
+func (s *Store) CreateOneShot(ctx context.Context, req OneShotRequest) (string, time.Time, error) {
+	sessionID, err := NewSessionID()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	suffix, err := NewSessionID()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	taskID := fmt.Sprintf("o:%s:%016x", req.Kind, suffix)
+	expiresAt := time.Now().Add(req.ExpiresIn)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := insertOneShot(ctx, tx, oneShotRow{
+		taskID:    taskID,
+		sessionID: int64(sessionID),
+		kind:      string(req.Kind),
+		role:      string(model.RoleSender),
+		agentID:   req.AgentID,
+		peerID:    req.PeerID,
+		params:    req.Params,
+		group:     req.Group,
+		expiresAt: expiresAt,
+	}); err != nil {
+		return "", time.Time{}, err
+	}
+
+	// A probe between agents needs the far end told about the session, or it
+	// drops every packet and the test reports total loss.
+	if req.Kind.NeedsPeer() && req.PeerID != nil {
+		if _, err := insertOneShot(ctx, tx, oneShotRow{
+			taskID:    "or:" + taskID,
+			sessionID: int64(sessionID),
+			kind:      string(req.Kind),
+			role:      string(model.RoleReflector),
+			agentID:   *req.PeerID,
+			peerID:    &req.AgentID,
+			params:    map[string]any{},
+			group:     req.Group,
+			expiresAt: expiresAt,
+		}); err != nil {
+			return "", time.Time{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", time.Time{}, err
+	}
+	return taskID, expiresAt, nil
+}
+
+type oneShotRow struct {
+	taskID    string
+	sessionID int64
+	kind      string
+	role      string
+	agentID   uuid.UUID
+	peerID    *uuid.UUID
+	params    map[string]any
+	group     string
+	expiresAt time.Time
+}
+
+func insertOneShot(ctx context.Context, tx pgx.Tx, r oneShotRow) (int, error) {
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO tasks (task_id, session_id, kind, role, agent_id, peer_id,
+		                   params, recurring, scheduled_for, group_name, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, false, now(), $8, $9)`,
+		r.taskID, r.sessionID, r.kind, r.role, r.agentID, r.peerID,
+		r.params, r.group, r.expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// TestStatus is a one-shot and its result, if it has one yet.
+type TestStatus struct {
+	TaskID    string          `json:"task_id"`
+	Kind      string          `json:"kind"`
+	State     string          `json:"state"`
+	Agent     string          `json:"agent"`
+	Peer      string          `json:"peer,omitempty"`
+	Group     string          `json:"group,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+	ExpiresAt *time.Time      `json:"expires_at,omitempty"`
+	Result    *TestResultView `json:"result,omitempty"`
+}
+
+// TestResultView is the reported outcome. Absent until the agent submits.
+type TestResultView struct {
+	Time     time.Time       `json:"time"`
+	Status   string          `json:"status"`
+	Error    *string         `json:"error,omitempty"`
+	RTTAvgUS *int64          `json:"rtt_avg_us,omitempty"`
+	LossPct  *float64        `json:"loss_pct,omitempty"`
+	TxBps    *int64          `json:"tx_bps,omitempty"`
+	RxBps    *int64          `json:"rx_bps,omitempty"`
+	Extra    json.RawMessage `json:"extra,omitempty"`
+}
+
+// TestByID returns a one-shot's state and its result if one has arrived.
+func (s *Store) TestByID(ctx context.Context, taskID string) (TestStatus, error) {
+	var t TestStatus
+	var peer, group *string
+	err := s.pool.QueryRow(ctx, `
+		SELECT t.task_id, t.kind, t.state, a.name, p.name, t.group_name,
+		       t.created_at, t.expires_at
+		FROM tasks t
+		JOIN agents a ON a.agent_id = t.agent_id
+		LEFT JOIN agents p ON p.agent_id = t.peer_id
+		WHERE t.task_id = $1`, taskID).
+		Scan(&t.TaskID, &t.Kind, &t.State, &t.Agent, &peer, &group,
+			&t.CreatedAt, &t.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TestStatus{}, ErrNotFound
+	}
+	if err != nil {
+		return TestStatus{}, err
+	}
+	if peer != nil {
+		t.Peer = *peer
+	}
+	if group != nil {
+		t.Group = *group
+	}
+
+	var r TestResultView
+	var extra []byte
+	err = s.pool.QueryRow(ctx, `
+		SELECT time, status, error, rtt_avg_us, loss_pct, tx_bps, rx_bps, extra
+		FROM results WHERE task_id = $1 ORDER BY time DESC LIMIT 1`, taskID).
+		Scan(&r.Time, &r.Status, &r.Error, &r.RTTAvgUS, &r.LossPct, &r.TxBps, &r.RxBps, &extra)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Not an error: the agent has simply not reported yet.
+	case err != nil:
+		return TestStatus{}, err
+	default:
+		r.Extra = extra
+		t.Result = &r
+	}
+	return t, nil
 }
