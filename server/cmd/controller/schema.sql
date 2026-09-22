@@ -77,7 +77,13 @@ CREATE TABLE IF NOT EXISTS tasks (
 
     kind         TEXT NOT NULL
                  CHECK (kind IN ('mqp_probe', 'twamp_probe', 'tcp_connect',
-                                 'routeros_btest', 'path_trace')),
+                                 'routeros_btest', 'path_trace', 'wifi_signal')),
+
+    -- Continuous plan work is cached by the agent and keeps running through a
+    -- controller outage. One-shots expire instead: a stale diagnostic answers
+    -- a question nobody is still asking.
+    recurring    BOOLEAN NOT NULL DEFAULT false,
+    expires_at   TIMESTAMPTZ,
     role         TEXT NOT NULL CHECK (role IN ('sender', 'reflector')),
 
     agent_id     UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,

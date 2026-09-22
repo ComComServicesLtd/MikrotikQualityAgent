@@ -92,7 +92,29 @@ const (
 	TaskTCPConnect    TaskKind = "tcp_connect"
 	TaskRouterOSBtest TaskKind = "routeros_btest"
 	TaskPathTrace     TaskKind = "path_trace"
+	// TaskWifiSignal reads wireless signal strength and registration data from
+	// the host router. Host telemetry, not a path measurement.
+	TaskWifiSignal TaskKind = "wifi_signal"
 )
+
+// Recurring reports whether this kind belongs to a group's continuous plan
+// rather than being an operator-issued one-shot.
+//
+// The distinction decides behaviour during a controller outage: continuous
+// work is cached and keeps running, one-shots expire. Executing a stale
+// diagnostic would answer a question nobody is still asking, about a moment
+// that has passed.
+func (k TaskKind) Recurring() bool {
+	switch k {
+	case TaskMQPProbe, TaskTwampProbe, TaskTCPConnect:
+		return true
+	default:
+		// Throughput, traceroute and wifi sampling can each be scheduled
+		// continuously, but only when a plan says so -- they are expensive or
+		// disruptive enough that recurring is not their default.
+		return false
+	}
+}
 
 type TaskRole string
 
@@ -132,6 +154,18 @@ type Task struct {
 	Peer           *PeerRef    `json:"peer,omitempty"`
 	Params         ProbeParams `json:"params"`
 	LeaseExpiresAt time.Time   `json:"lease_expires_at"`
+	// Recurring marks this as part of the group's continuous plan, which the
+	// agent caches and keeps running when the controller is unreachable.
+	Recurring bool `json:"recurring"`
+	// ExpiresAt bounds a one-shot's usefulness. An agent that receives or
+	// reaches it after this point reports `skipped` instead of running it.
+	// Zero means no expiry.
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+}
+
+// Stale reports whether a one-shot has outlived its usefulness.
+func (t Task) Stale(now time.Time) bool {
+	return !t.Recurring && !t.ExpiresAt.IsZero() && now.After(t.ExpiresAt)
 }
 
 // --- results -------------------------------------------------------------

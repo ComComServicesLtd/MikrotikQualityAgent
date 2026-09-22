@@ -70,6 +70,45 @@ main
 └── tasks           executor: dispatch a leased task to the right runner
 ```
 
+### What the agent measures, and from where
+
+Three distinct sources, which behave differently and must not be conflated:
+
+1. **Probe** — MQP between agents. Latency, jitter, loss, reordering, DSCP
+   conformance, MOS. This is the continuous core.
+2. **Host telemetry** — read from the host router over the RouterOS API:
+   throughput via `/tool/bandwidth-test`, wireless signal strength and
+   registration data, interface counters. Measures the device's own view rather
+   than a path between two agents.
+3. **Path** — traceroute-style hop discovery. Structural rather than
+   quantitative; it explains *why* a probe result changed.
+
+### Continuous plan vs one-shot task
+
+The primary goal is a **continuous** measurement of what users on the network
+actually experience. Ad-hoc diagnostics are secondary and are treated
+differently in one important respect: what happens when the controller is
+unreachable.
+
+| | Continuous plan | One-shot task |
+|---|---|---|
+| Examples | mesh probes, periodic throughput, wifi signal sampling | traceroute, single bandwidth test, wifi snapshot |
+| Source | the group's mesh plan | an operator, via `POST /tests` |
+| Cached locally | **Yes** — keeps running through a comms outage | **No** |
+| Survives controller loss | Yes, by design | No — expires instead |
+
+A one-shot carries an expiry. If the agent cannot run it before then — or
+receives it late because comms were down — it is **abandoned and reported as
+`skipped`**, not executed. Running a stale diagnostic would produce a
+confident-looking answer about a moment that has passed, attached to a question
+nobody is still asking. The continuous plan has the opposite requirement: it is
+cached precisely so that an outage, which is when the data matters most, does
+not stop measurement.
+
+Results from the continuous plan queue in the [spool](../agent/src/spool.rs)
+while comms are down. One-shot results do not need to: if nobody was waiting
+for the answer, there is nothing to deliver.
+
 ### Identity
 
 Each agent has:

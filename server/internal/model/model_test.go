@@ -171,3 +171,45 @@ func TestOmittedStatsSectionsStayAbsentInJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestContinuousKindsAreRecurringAndDiagnosticsAreNot(t *testing.T) {
+	// The split decides what survives a controller outage, so it is worth
+	// pinning rather than leaving to the reader of a switch statement.
+	for _, k := range []TaskKind{TaskMQPProbe, TaskTwampProbe, TaskTCPConnect} {
+		if !k.Recurring() {
+			t.Errorf("%s is continuous measurement and should be recurring", k)
+		}
+	}
+	for _, k := range []TaskKind{TaskPathTrace, TaskWifiSignal, TaskRouterOSBtest} {
+		if k.Recurring() {
+			t.Errorf("%s is a diagnostic and should not default to recurring", k)
+		}
+	}
+}
+
+func TestOneShotGoesStaleButContinuousNeverDoes(t *testing.T) {
+	now := time.Now()
+	past := now.Add(-time.Hour)
+
+	oneShot := Task{Kind: TaskPathTrace, ExpiresAt: past}
+	if !oneShot.Stale(now) {
+		t.Fatal("an expired traceroute must be skipped, not run late")
+	}
+
+	fresh := Task{Kind: TaskPathTrace, ExpiresAt: now.Add(time.Hour)}
+	if fresh.Stale(now) {
+		t.Fatal("an unexpired one-shot should still run")
+	}
+
+	// The continuous plan is cached precisely so it keeps running through an
+	// outage; it must never be discarded for age.
+	continuous := Task{Kind: TaskMQPProbe, Recurring: true, ExpiresAt: past}
+	if continuous.Stale(now) {
+		t.Fatal("continuous plan work must never go stale")
+	}
+
+	noExpiry := Task{Kind: TaskWifiSignal}
+	if noExpiry.Stale(now) {
+		t.Fatal("a one-shot with no expiry set should not be considered stale")
+	}
+}
