@@ -33,6 +33,16 @@ type Candidate struct {
 	// Hub marks an agent as a hub for the hub plan.
 	Hub bool
 
+	// ReflectorOnly marks an agent that may answer probes in this group but
+	// must never originate them.
+	//
+	// This is what makes a shared upstream agent workable. One such agent may
+	// belong to many customer groups; if it were a full member of each, the
+	// scheduler would have it originate probes into every one of them, and its
+	// send load would grow with the customer count rather than staying flat.
+	// Receiving is cheap and scales — one UDP socket serves every session.
+	ReflectorOnly bool
+
 	Online bool
 	Caps   model.Capabilities
 }
@@ -56,11 +66,13 @@ type Exclusion struct {
 }
 
 const (
-	ReasonOffline       = "agent has not heartbeated recently"
-	ReasonNoMQP         = "agent does not support the probe protocol"
-	ReasonBothBehindNAT = "neither agent is reachable inbound, so no session can be established"
-	ReasonNoAddress     = "agent has no probe address the controller can hand to a peer"
-	ReasonSingleAgent   = "a group needs at least two usable agents to form a mesh"
+	ReasonOffline           = "agent has not heartbeated recently"
+	ReasonNoMQP             = "agent does not support the probe protocol"
+	ReasonBothBehindNAT     = "neither agent is reachable inbound, so no session can be established"
+	ReasonBothReflectorOnly = "neither agent may originate probes in this group"
+	ReasonSenderCannotSend  = "the only agent that could reach the other is reflector-only here"
+	ReasonNoAddress         = "agent has no probe address the controller can hand to a peer"
+	ReasonSingleAgent       = "a group needs at least two usable agents to form a mesh"
 )
 
 // PlanMesh returns the ordered pairs to schedule for one cycle.
@@ -112,27 +124,50 @@ func PlanMesh(plan model.MeshPlan, fanout int, agents []Candidate, cycle int) ([
 		candidates = ring(usable)
 	}
 
-	// Enforce the NAT rule last, uniformly, rather than inside each plan.
+	// Orientation is settled here, once, rather than inside each plan: both
+	// constraints -- who can be reached, and who may originate -- have to hold
+	// at the same time, and deciding them separately gets one of them wrong.
 	pairings := make([]Pairing, 0, len(candidates))
 	for _, p := range candidates {
+		forward := orientable(p.Sender, p.Reflector)
+		reverse := orientable(p.Reflector, p.Sender)
+
 		switch {
-		case p.Reflector.InboundReachable:
+		case forward:
 			pairings = append(pairings, p)
-		case p.Sender.InboundReachable:
-			// The reflector cannot be probed, but the sender can. Measuring
-			// the reverse direction is far better than measuring nothing, and
-			// for a symmetric path it answers the same question.
+		case reverse:
+			// Measuring the reverse direction beats measuring nothing, and on
+			// a symmetric path it answers the same question.
 			pairings = append(pairings, Pairing{Sender: p.Reflector, Reflector: p.Sender})
 		default:
 			excluded = append(excluded, Exclusion{
 				Sender:    p.Sender.Name,
 				Reflector: p.Reflector.Name,
-				Reason:    ReasonBothBehindNAT,
+				Reason:    orientationFailure(p.Sender, p.Reflector),
 			})
 		}
 	}
 
 	return dedupe(pairings), excluded
+}
+
+// orientable reports whether `from` may probe `to`: the sender must be allowed
+// to originate here, and the reflector must be reachable inbound.
+func orientable(from, to Candidate) bool {
+	return !from.ReflectorOnly && to.InboundReachable
+}
+
+// orientationFailure names the binding constraint, so the log says which of the
+// two problems to go and fix.
+func orientationFailure(a, b Candidate) string {
+	switch {
+	case a.ReflectorOnly && b.ReflectorOnly:
+		return ReasonBothReflectorOnly
+	case !a.InboundReachable && !b.InboundReachable:
+		return ReasonBothBehindNAT
+	default:
+		return ReasonSenderCannotSend
+	}
 }
 
 // fullMesh is every ordered pair: n*(n-1). Grows quadratically and will

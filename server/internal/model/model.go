@@ -39,10 +39,10 @@ type Group struct {
 // Capabilities is what an agent reports it can do. The scheduler uses this to
 // avoid handing an agent work it will only skip.
 type Capabilities struct {
-	MQP            bool `json:"mqp"`
-	TwampLight     bool `json:"twamp_light"`
-	RouterOSBtest  bool `json:"routeros_btest"`
-	ProbePort      int  `json:"probe_port"`
+	MQP           bool `json:"mqp"`
+	TwampLight    bool `json:"twamp_light"`
+	RouterOSBtest bool `json:"routeros_btest"`
+	ProbePort     int  `json:"probe_port"`
 }
 
 type HostInfo struct {
@@ -201,15 +201,15 @@ type ReorderStats struct {
 }
 
 type DSCPStats struct {
-	Requested      int     `json:"requested"`
-	ObservedMode   int     `json:"observed_mode"`
-	ConformantPct  float64 `json:"conformant_pct"`
+	Requested     int     `json:"requested"`
+	ObservedMode  int     `json:"observed_mode"`
+	ConformantPct float64 `json:"conformant_pct"`
 }
 
 type MOSStats struct {
-	Codec    string  `json:"codec"`
-	RFactor  float64 `json:"r_factor"`
-	MOS      float64 `json:"mos"`
+	Codec   string  `json:"codec"`
+	RFactor float64 `json:"r_factor"`
+	MOS     float64 `json:"mos"`
 }
 
 type ThroughputStats struct {

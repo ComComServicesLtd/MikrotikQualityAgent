@@ -27,11 +27,11 @@ func agent(name string, opts ...func(*Candidate)) Candidate {
 	return c
 }
 
-func behindNAT(c *Candidate)  { c.InboundReachable = false }
-func offline(c *Candidate)    { c.Online = false }
-func isHub(c *Candidate)      { c.Hub = true }
-func noMQP(c *Candidate)      { c.Caps.MQP = false }
-func noAddress(c *Candidate)  { c.Address = "" }
+func behindNAT(c *Candidate) { c.InboundReachable = false }
+func offline(c *Candidate)   { c.Online = false }
+func isHub(c *Candidate)     { c.Hub = true }
+func noMQP(c *Candidate)     { c.Caps.MQP = false }
+func noAddress(c *Candidate) { c.Address = "" }
 
 func agents(names ...string) []Candidate {
 	out := make([]Candidate, 0, len(names))
@@ -245,7 +245,6 @@ func TestHubPlanMeasuresSpokesToHubsAndHubsToEachOther(t *testing.T) {
 	}
 }
 
-
 func TestHubPlanWithNoHubDesignatedFallsBackToRing(t *testing.T) {
 	// Silently measuring nothing would be the worst outcome here.
 	ps, ex := PlanMesh(model.MeshHub, 0, agents("a", "b", "c"), 0)
@@ -325,3 +324,86 @@ func keys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+func reflectorOnly(c *Candidate) { c.ReflectorOnly = true }
+
+func TestSharedUpstreamAgentNeverOriginatesProbes(t *testing.T) {
+	// The customer topology: two local agents meshing with each other, plus a
+	// shared upstream agent that belongs to many customer groups. If it were a
+	// full member its send load would grow with the customer count; as a
+	// reflector it only ever answers.
+	group := []Candidate{
+		agent("cust-wifi"),
+		agent("cust-eth"),
+		agent("upstream-pop", reflectorOnly, isHub),
+	}
+	ps, _ := PlanMesh(model.MeshFull, 0, group, 0)
+
+	for _, p := range ps {
+		if p.Sender.Name == "upstream-pop" {
+			t.Fatalf("upstream agent scheduled as sender in %s->%s", p.Sender.Name, p.Reflector.Name)
+		}
+	}
+	// It must still be measured *toward* — that is the whole point of it.
+	probed := 0
+	for _, p := range ps {
+		if p.Reflector.Name == "upstream-pop" {
+			probed++
+		}
+	}
+	if probed != 2 {
+		t.Fatalf("both local agents should probe upstream, got %d", probed)
+	}
+}
+
+func TestLocalAgentsStillMeshWithEachOtherAlongsideAnUpstream(t *testing.T) {
+	group := []Candidate{
+		agent("cust-eth"),
+		agent("cust-wifi"),
+		agent("upstream-pop", reflectorOnly),
+	}
+	got := pairNames(mustPairs(PlanMesh(model.MeshFull, 0, group, 0)))
+	want := []string{
+		"cust-eth->cust-wifi", "cust-eth->upstream-pop",
+		"cust-wifi->cust-eth", "cust-wifi->upstream-pop",
+	}
+	if !equal(got, want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+func TestTwoReflectorOnlyAgentsAreExcludedWithTheRightReason(t *testing.T) {
+	// Two shared upstreams in the same group cannot measure each other: neither
+	// is allowed to originate. The reason must say that rather than blaming NAT.
+	group := []Candidate{agent("pop-a", reflectorOnly), agent("pop-b", reflectorOnly)}
+	ps, ex := PlanMesh(model.MeshFull, 0, group, 0)
+	if len(ps) != 0 {
+		t.Fatalf("expected nothing schedulable, got %v", pairNames(ps))
+	}
+	if !hasReason(ex, ReasonBothReflectorOnly) {
+		t.Fatalf("wrong diagnosis: %+v", ex)
+	}
+}
+
+func TestReflectorOnlyAndNATCannotBeSatisfiedTogether(t *testing.T) {
+	// The local agent is behind NAT so it can only send; the upstream is
+	// reflector-only so it can only receive. That combination works.
+	ok := []Candidate{agent("branch", behindNAT), agent("pop", reflectorOnly)}
+	ps, _ := PlanMesh(model.MeshRing, 0, ok, 0)
+	if got := pairNames(ps); !equal(got, []string{"branch->pop"}) {
+		t.Fatalf("want branch->pop, got %v", got)
+	}
+
+	// Reverse the constraints and nothing can be arranged: the only agent
+	// permitted to send is the one that cannot be reached.
+	bad := []Candidate{agent("branch"), agent("pop", reflectorOnly, behindNAT)}
+	ps2, ex := PlanMesh(model.MeshRing, 0, bad, 0)
+	if len(ps2) != 0 {
+		t.Fatalf("expected nothing schedulable, got %v", pairNames(ps2))
+	}
+	if !hasReason(ex, ReasonSenderCannotSend) {
+		t.Fatalf("wrong diagnosis: %+v", ex)
+	}
+}
+
+func mustPairs(ps []Pairing, _ []Exclusion) []Pairing { return ps }

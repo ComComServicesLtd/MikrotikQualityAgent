@@ -64,6 +64,26 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE INDEX IF NOT EXISTS agents_group_idx ON agents (group_name);
 CREATE INDEX IF NOT EXISTS agents_last_seen_idx ON agents (last_seen_at DESC);
 
+-- An agent's group memberships.
+--
+-- Many-to-many, because a shared upstream agent belongs to every customer
+-- group it serves. agents.group_name remains the agent's *home* group -- the
+-- one it enrolled into and reports as its own -- while this table is what the
+-- scheduler actually plans from.
+CREATE TABLE IF NOT EXISTS agent_groups (
+    agent_id   UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    group_name TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
+    -- 'member' takes part in the mesh normally. 'reflector' may answer probes
+    -- but never originate them: a shared upstream agent in fifty customer
+    -- groups would otherwise have its send load grow with the customer count,
+    -- while answering costs it one socket regardless.
+    role       TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'reflector')),
+    added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (agent_id, group_name)
+);
+
+CREATE INDEX IF NOT EXISTS agent_groups_group_idx ON agent_groups (group_name);
+
 -- Single-use, group-scoped registration tokens.
 CREATE TABLE IF NOT EXISTS enrolment_tokens (
     token_hash  BYTEA PRIMARY KEY,
@@ -104,6 +124,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     leased_at    TIMESTAMPTZ,
     lease_expires_at TIMESTAMPTZ,
 
+    -- Which group this task was scheduled for. Results are filed under it
+    -- rather than under the submitting agent's own group: a shared upstream
+    -- agent answers for many customers, and attributing its results to itself
+    -- would make them vanish from the customer's view entirely.
+    group_name   TEXT,
+
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     scheduled_for TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -117,6 +143,15 @@ CREATE INDEX IF NOT EXISTS tasks_pending_idx
 CREATE INDEX IF NOT EXISTS tasks_lease_idx
     ON tasks (lease_expires_at)
     WHERE state = 'leased';
+
+-- Existing deployments predate the columns above; adding them is idempotent.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS group_name TEXT;
+
+-- Every agent belongs to its home group, so seed that membership for any
+-- agent registered before this table existed.
+INSERT INTO agent_groups (agent_id, group_name)
+SELECT agent_id, group_name FROM agents
+ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------- results
 

@@ -109,6 +109,37 @@ Results from the continuous plan queue in the [spool](../agent/src/spool.rs)
 while comms are down. One-shot results do not need to: if nobody was waiting
 for the answer, there is nothing to deliver.
 
+### Shared agents and group membership
+
+An agent belongs to **many** groups, not one. The driving case is an ISP
+topology: each customer site is a group whose agents mesh with each other — one
+on wifi, one on ethernet — while a handful of upstream agents at the provider's
+own sites are shared across every customer.
+
+Membership carries a role:
+
+| Role | Behaviour |
+|---|---|
+| `member` | Full mesh participant: sends and reflects. |
+| `reflector` | Answers probes, **never originates them**. |
+
+A shared upstream agent joins each customer group as a `reflector`. The
+distinction is not cosmetic: as a full member of fifty customer groups it would
+be scheduled to originate probes into all fifty, so its send load would grow
+with the customer count. Answering costs it one socket regardless of how many
+groups it serves, because the reflector multiplexes every session on a single
+port.
+
+`agents.group_name` remains the agent's **home** group — where it enrolled and
+what it reports as its own. It cannot be removed from that one; deleting the
+agent is the way to retire it. The scheduler plans from the membership table,
+not from the home group.
+
+**Results are filed under the task's group, never the submitting agent's.** A
+shared upstream agent answers for many customers at once; attributing its
+results to its own home group would make every customer's measurements vanish
+from the view they belong to.
+
 ### Identity
 
 Each agent has:

@@ -173,7 +173,8 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | RouterOS bandwidth-test offload | Not yet |
 | Discovery: traceroute + ip-scan | Implemented, verified against a live router |
 | Discovery: pcap / broadcast-source attribution | Not yet — storms detected by counters only |
-| Operator API (groups, tokens, agents, queries) | Implemented, tested |
+| Operator API (groups, tokens, agents, membership, queries) | Implemented, tested |
+| Many-to-many group membership with roles | Implemented, verified with a shared upstream agent |
 | Dashboard (embedded + standalone) | Implemented, verified with live data |
 | TWAMP-Light interop | Not yet |
 

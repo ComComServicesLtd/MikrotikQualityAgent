@@ -41,6 +41,11 @@ func (s *Server) operatorRoutes(mux *http.ServeMux) {
 	mux.Handle("PATCH /api/v1/agents/{id}", s.operatorAuth(s.handlePatchAgent))
 	mux.Handle("DELETE /api/v1/agents/{id}", s.operatorAuth(s.handleDeleteAgent))
 
+	mux.Handle("GET /api/v1/groups/{name}/members", s.operatorAuth(s.handleListMembers))
+	mux.Handle("POST /api/v1/groups/{name}/members", s.operatorAuth(s.handleAddMember))
+	mux.Handle("DELETE /api/v1/groups/{name}/members/{agent}", s.operatorAuth(s.handleRemoveMember))
+	mux.Handle("GET /api/v1/agents/{id}/groups", s.operatorAuth(s.handleAgentGroups))
+
 	mux.Handle("GET /api/v1/pairs", s.operatorAuth(s.handlePairs))
 	mux.Handle("GET /api/v1/series", s.operatorAuth(s.handleSeries))
 }
@@ -326,4 +331,69 @@ func pathUUID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 		return uuid.Nil, false
 	}
 	return id, true
+}
+
+type memberRequest struct {
+	AgentID string `json:"agent_id"`
+	Role    string `json:"role"`
+}
+
+func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
+	ms, err := s.st.Members(r.Context(), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, "list members", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ms)
+}
+
+func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
+	var req memberRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	id, err := uuid.Parse(req.AgentID)
+	if err != nil {
+		problem(w, http.StatusBadRequest, "invalid agent_id", "expected a UUID")
+		return
+	}
+	group := r.PathValue("name")
+	if err := s.st.AddMember(r.Context(), group, id, req.Role); err != nil {
+		problem(w, http.StatusBadRequest, "could not add member", err.Error())
+		return
+	}
+	s.log.Info("group membership set", "group", group, "agent", id, "role", req.Role)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("agent"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "invalid agent id", "expected a UUID")
+		return
+	}
+	group := r.PathValue("name")
+	err = s.st.RemoveMember(r.Context(), group, id)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		problem(w, http.StatusNotFound, "no such membership", "")
+	case err != nil:
+		problem(w, http.StatusConflict, "could not remove member", err.Error())
+	default:
+		s.log.Info("group membership removed", "group", group, "agent", id)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (s *Server) handleAgentGroups(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	ms, err := s.st.GroupsOf(r.Context(), id)
+	if err != nil {
+		s.fail(w, "list agent groups", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ms)
 }

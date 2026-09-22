@@ -190,6 +190,14 @@ func (s *Store) Register(ctx context.Context, req RegisterRequest) (RegisterResu
 		return RegisterResult{}, err
 	}
 
+	// The home group is a membership like any other, so the scheduler -- which
+	// plans from agent_groups -- sees a freshly enrolled agent immediately.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_groups (agent_id, group_name) VALUES ($1, $2)
+		ON CONFLICT (agent_id, group_name) DO NOTHING`, id, req.Group); err != nil {
+		return RegisterResult{}, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return RegisterResult{}, err
 	}
@@ -389,13 +397,22 @@ func (s *Store) SaveResult(ctx context.Context, agentID uuid.UUID, group string,
 
 	var peerID *uuid.UUID
 	var kind string
-	err = tx.QueryRow(ctx, `SELECT peer_id, kind FROM tasks WHERE task_id = $1`, r.TaskID).
-		Scan(&peerID, &kind)
+	var taskGroup *string
+	err = tx.QueryRow(ctx,
+		`SELECT peer_id, kind, group_name FROM tasks WHERE task_id = $1`, r.TaskID).
+		Scan(&peerID, &kind, &taskGroup)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrNotFound
 	}
 	if err != nil {
 		return false, err
+	}
+
+	// The task's group wins over the submitting agent's own. A shared upstream
+	// agent answers for many customers; filing its results under its home group
+	// would make them disappear from the customer view they belong to.
+	if taskGroup != nil && *taskGroup != "" {
+		group = *taskGroup
 	}
 
 	tag, err := tx.Exec(ctx, `

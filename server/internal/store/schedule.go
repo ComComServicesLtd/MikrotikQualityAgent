@@ -40,11 +40,14 @@ func (s *Store) Groups(ctx context.Context) ([]model.Group, error) {
 // status column, so it cannot drift out of step with reality.
 func (s *Store) Candidates(ctx context.Context, group string) ([]scheduler.Candidate, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT agent_id, name, COALESCE(host(probe_addr), ''), probe_port,
-		       inbound_reachable, is_hub, capabilities,
-		       (NOT disabled AND last_seen_at IS NOT NULL AND last_seen_at > now() - $2::interval)
-		FROM agents
-		WHERE group_name = $1`, group, model.StaleAfter.String())
+		SELECT a.agent_id, a.name, COALESCE(host(a.probe_addr), ''), a.probe_port,
+		       a.inbound_reachable, a.is_hub, a.capabilities,
+		       (NOT a.disabled AND a.last_seen_at IS NOT NULL
+		        AND a.last_seen_at > now() - $2::interval),
+		       (ag.role = 'reflector')
+		FROM agent_groups ag
+		JOIN agents a ON a.agent_id = ag.agent_id
+		WHERE ag.group_name = $1`, group, model.StaleAfter.String())
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +57,7 @@ func (s *Store) Candidates(ctx context.Context, group string) ([]scheduler.Candi
 	for rows.Next() {
 		var c scheduler.Candidate
 		if err := rows.Scan(&c.AgentID, &c.Name, &c.Address, &c.ProbePort,
-			&c.InboundReachable, &c.Hub, &c.Caps, &c.Online); err != nil {
+			&c.InboundReachable, &c.Hub, &c.Caps, &c.Online, &c.ReflectorOnly); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -117,6 +120,7 @@ func (s *Store) CreateMeshTasks(
 			params:    params,
 			recurring: true,
 			startAt:   startAt,
+			group:     group,
 		})
 		if err != nil {
 			return created, err
@@ -135,6 +139,7 @@ func (s *Store) CreateMeshTasks(
 			params:    map[string]any{},
 			recurring: true,
 			startAt:   startAt,
+			group:     group,
 		})
 		if err != nil {
 			return created, err
@@ -158,16 +163,17 @@ type taskRow struct {
 	params    map[string]any
 	recurring bool
 	startAt   time.Time
+	group     string
 }
 
 func insertTask(ctx context.Context, tx pgx.Tx, r taskRow) (int, error) {
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO tasks (task_id, session_id, kind, role, agent_id, peer_id,
-		                   params, recurring, scheduled_for)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		                   params, recurring, scheduled_for, group_name)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (task_id) DO NOTHING`,
 		r.taskID, r.sessionID, r.kind, r.role, r.agentID, r.peerID,
-		r.params, r.recurring, r.startAt)
+		r.params, r.recurring, r.startAt, r.group)
 	if err != nil {
 		return 0, err
 	}

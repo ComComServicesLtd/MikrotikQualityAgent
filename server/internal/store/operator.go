@@ -253,19 +253,19 @@ func (s *Store) Series(ctx context.Context, q SeriesQuery) ([]SeriesPoint, error
 
 // PairSummary is the current state of one directed agent pair.
 type PairSummary struct {
-	AgentID   uuid.UUID  `json:"agent_id"`
-	Agent     string     `json:"agent"`
-	PeerID    *uuid.UUID `json:"peer_id,omitempty"`
-	Peer      string     `json:"peer,omitempty"`
-	Group     string     `json:"group"`
-	LastSeen  time.Time  `json:"last_result_at"`
-	Samples   int        `json:"samples"`
-	RTTAvgUS  *float64   `json:"rtt_avg_us,omitempty"`
-	JitterUS  *float64   `json:"jitter_us,omitempty"`
-	LossPct   *float64   `json:"loss_pct,omitempty"`
-	MOS       *float64   `json:"mos,omitempty"`
-	DSCPPct   *float64   `json:"dscp_conformant_pct,omitempty"`
-	Failures  int        `json:"failures"`
+	AgentID  uuid.UUID  `json:"agent_id"`
+	Agent    string     `json:"agent"`
+	PeerID   *uuid.UUID `json:"peer_id,omitempty"`
+	Peer     string     `json:"peer,omitempty"`
+	Group    string     `json:"group"`
+	LastSeen time.Time  `json:"last_result_at"`
+	Samples  int        `json:"samples"`
+	RTTAvgUS *float64   `json:"rtt_avg_us,omitempty"`
+	JitterUS *float64   `json:"jitter_us,omitempty"`
+	LossPct  *float64   `json:"loss_pct,omitempty"`
+	MOS      *float64   `json:"mos,omitempty"`
+	DSCPPct  *float64   `json:"dscp_conformant_pct,omitempty"`
+	Failures int        `json:"failures"`
 }
 
 // Pairs summarises every measured path over a window — the overview a
@@ -319,4 +319,109 @@ func (s *Store) AgentByID(ctx context.Context, id uuid.UUID) (model.Agent, error
 	}
 	a.ProbeAddr = probeAddr
 	return a, err
+}
+
+// --- group membership -----------------------------------------------------
+
+// Membership is one agent's place in one group.
+type Membership struct {
+	AgentID uuid.UUID `json:"agent_id"`
+	Name    string    `json:"name"`
+	Group   string    `json:"group"`
+	// "member" takes part in the mesh normally; "reflector" answers probes but
+	// never originates them.
+	Role    string    `json:"role"`
+	AddedAt time.Time `json:"added_at"`
+}
+
+var validRoles = map[string]bool{"member": true, "reflector": true}
+
+// AddMember places an agent in a group, or changes the role it holds there.
+func (s *Store) AddMember(ctx context.Context, group string, id uuid.UUID, role string) error {
+	if role == "" {
+		role = "member"
+	}
+	if !validRoles[role] {
+		return fmt.Errorf("role %q is not one of member, reflector", role)
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO agent_groups (agent_id, group_name, role)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (agent_id, group_name) DO UPDATE SET role = EXCLUDED.role`,
+		id, group, role)
+	return err
+}
+
+// RemoveMember takes an agent out of a group.
+//
+// An agent's home group cannot be removed this way: it is where the agent
+// enrolled and what it reports as its own, and dropping it would leave the
+// agent registered but in no mesh at all, which looks like a scheduler fault
+// rather than a configuration choice.
+func (s *Store) RemoveMember(ctx context.Context, group string, id uuid.UUID) error {
+	var home string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT group_name FROM agents WHERE agent_id = $1`, id).Scan(&home); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if home == group {
+		return fmt.Errorf("%q is this agent's home group; delete the agent instead", group)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM agent_groups WHERE agent_id = $1 AND group_name = $2`, id, group)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Members lists a group's agents and the role each holds.
+func (s *Store) Members(ctx context.Context, group string) ([]Membership, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT ag.agent_id, a.name, ag.group_name, ag.role, ag.added_at
+		FROM agent_groups ag JOIN agents a ON a.agent_id = ag.agent_id
+		WHERE ag.group_name = $1 ORDER BY a.name`, group)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Membership{}
+	for rows.Next() {
+		var m Membership
+		if err := rows.Scan(&m.AgentID, &m.Name, &m.Group, &m.Role, &m.AddedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// GroupsOf lists every group an agent belongs to — the view that matters for a
+// shared upstream agent, where the home group is the least interesting one.
+func (s *Store) GroupsOf(ctx context.Context, id uuid.UUID) ([]Membership, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT ag.agent_id, a.name, ag.group_name, ag.role, ag.added_at
+		FROM agent_groups ag JOIN agents a ON a.agent_id = ag.agent_id
+		WHERE ag.agent_id = $1 ORDER BY ag.group_name`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Membership{}
+	for rows.Next() {
+		var m Membership
+		if err := rows.Scan(&m.AgentID, &m.Name, &m.Group, &m.Role, &m.AddedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
