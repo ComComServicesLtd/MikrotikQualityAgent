@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ComComServicesLtd/MikrotikQualityAgent/server/internal/api"
+	"github.com/ComComServicesLtd/MikrotikQualityAgent/server/internal/scheduler"
 	"github.com/ComComServicesLtd/MikrotikQualityAgent/server/internal/store"
 )
 
@@ -101,6 +102,7 @@ func run(log *slog.Logger) error {
 	}
 
 	go sweepLeases(ctx, log, st)
+	go runScheduler(ctx, log, st)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -161,6 +163,91 @@ func sweepLeases(ctx context.Context, log *slog.Logger, st *store.Store) {
 				log.Info("returned expired leases to the queue", "count", n)
 			}
 		}
+	}
+}
+
+// runScheduler plans each group's mesh on its interval and writes the tasks.
+//
+// One cycle counter per group advances independently, which is what lets the
+// partial plan rotate coverage without every group moving in lockstep.
+func runScheduler(ctx context.Context, log *slog.Logger, st *store.Store) {
+	cycles := map[string]int{}
+	nextRun := map[string]time.Time{}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		groups, err := st.Groups(ctx)
+		if err != nil {
+			log.Error("scheduler could not list groups", "error", err)
+			continue
+		}
+
+		for _, g := range groups {
+			if t, ok := nextRun[g.Name]; ok && time.Now().Before(t) {
+				continue
+			}
+			interval := time.Duration(g.IntervalS) * time.Second
+			nextRun[g.Name] = time.Now().Add(interval)
+
+			candidates, err := st.Candidates(ctx, g.Name)
+			if err != nil {
+				log.Error("scheduler could not load agents", "group", g.Name, "error", err)
+				continue
+			}
+
+			cycle := cycles[g.Name]
+			cycles[g.Name] = cycle + 1
+
+			pairs, excluded := scheduler.PlanMesh(g.MeshPlan, g.MeshFanout, candidates, cycle)
+
+			// Report what was left out. A mesh that quietly covers less than it
+			// appears to is worse than one that declares its own gaps: an
+			// operator looking at a sparse graph needs to know whether the
+			// network is broken or the path was simply never tested.
+			for _, e := range excluded {
+				log.Info("scheduler excluded a pairing",
+					"group", g.Name, "sender", e.Sender, "reflector", e.Reflector,
+					"reason", e.Reason)
+			}
+			if len(pairs) == 0 {
+				continue
+			}
+
+			n, err := st.CreateMeshTasks(ctx, g.Name, pairs, cycle, interval, defaultProbeParams())
+			if err != nil {
+				log.Error("scheduler could not create tasks", "group", g.Name, "error", err)
+				continue
+			}
+			log.Info("scheduled a mesh cycle",
+				"group", g.Name, "plan", g.MeshPlan, "cycle", cycle,
+				"pairs", len(pairs), "tasks_created", n, "excluded", len(excluded))
+		}
+
+		if n, err := st.PurgeCompletedTasks(ctx, 24*time.Hour); err == nil && n > 0 {
+			log.Debug("purged completed tasks", "count", n)
+		}
+	}
+}
+
+// defaultProbeParams is one 20 ms-spaced run of 300 packets at EF, which is
+// about six seconds of traffic shaped like a voice call -- the thing users
+// notice first when a path degrades.
+func defaultProbeParams() map[string]any {
+	return map[string]any{
+		"count":         300,
+		"interval_ms":   20,
+		"payload_bytes": 172,
+		"dscp":          46,
+		"timeout_ms":    1000,
+		"codec":         "g711",
 	}
 }
 

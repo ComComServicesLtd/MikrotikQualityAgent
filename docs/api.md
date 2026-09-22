@@ -77,7 +77,7 @@ reassign it.
 [
   {
     "task_id": "t_01J…",
-    "session_id": "7f3a9c2b1d4e8a60",   // u64 hex — also used on the wire
+    "session_id": "9166399904847513184",  // u64 as a DECIMAL string
     "kind": "mqp_probe",                 // mqp_probe | twamp_probe | tcp_connect
                                          // | routeros_btest | path_trace
     "role": "sender",                    // sender | reflector
@@ -114,7 +114,7 @@ drain its spool.
   "results": [
     {
       "task_id": "t_01J…",
-      "session_id": "7f3a9c2b1d4e8a60",
+      "session_id": "9166399904847513184",
       "started_at": "2026-09-21T18:00:00Z",
       "ended_at":   "2026-09-21T18:00:06Z",
       "status": "ok",                    // ok | partial | failed | skipped
@@ -172,6 +172,11 @@ drain its spool.
 
 ## Conventions
 
+- `session_id` is a u64 rendered as a **decimal** string, never hex and never
+  a JSON number. A number would be parsed as f64 by most clients and silently
+  rounded above 2^53; bare hex is ambiguous because every decimal string is
+  also valid hex, so `"255"` would be read as 597 and target a session the
+  reflector never granted — surfacing as 100% loss on a healthy path.
 - Durations in field names carry their unit (`_ms`, `_us`, `_s`, `_bps`).
   Latency is microseconds throughout — milliseconds lose too much resolution on
   a LAN, nanoseconds overstate the accuracy we actually have.

@@ -237,7 +237,12 @@ impl Agent {
             // full cadence regardless of how the calls above went.
             if let Some(task) = self.plan.next_due(Instant::now()) {
                 self.execute(task).await;
-                continue; // check for more due work before sleeping
+                // Submit before looping back for more work. Draining only when
+                // the queue is empty would starve submission entirely whenever
+                // there is a backlog -- results would accumulate until the
+                // spool overflowed, on an agent that looked perfectly healthy.
+                self.drain_spool().await;
+                continue;
             }
 
             self.drain_spool().await;
@@ -400,7 +405,7 @@ impl Agent {
                 );
                 serde_json::json!({
                     "task_id": task.task_id,
-                    "session_id": format!("{:016x}", task.session_id),
+                    "session_id": task.session_id.to_string(),
                     "started_at": rfc3339(started),
                     "ended_at": rfc3339(ended),
                     // A run where nothing came back is a valid measurement of a
@@ -427,7 +432,7 @@ impl Agent {
         warn!(task = %task.task_id, error = err, "task failed");
         serde_json::json!({
             "task_id": task.task_id,
-            "session_id": format!("{:016x}", task.session_id),
+            "session_id": task.session_id.to_string(),
             "started_at": rfc3339(started),
             "ended_at": rfc3339(ended),
             "status": "failed",
@@ -439,7 +444,7 @@ impl Agent {
         let now = time::OffsetDateTime::now_utc();
         self.enqueue(serde_json::json!({
             "task_id": task.task_id,
-            "session_id": format!("{:016x}", task.session_id),
+            "session_id": task.session_id.to_string(),
             "started_at": rfc3339(now),
             "ended_at": rfc3339(now),
             "status": "skipped",

@@ -209,11 +209,11 @@ func (s *Store) MarkEnrolmentUsed(ctx context.Context, token string, agentID uui
 func (s *Store) AuthenticateAgent(ctx context.Context, token string) (model.Agent, error) {
 	var a model.Agent
 	var stored []byte
-	var probeAddr *string
+	var probeAddr string
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT agent_id, name, group_name, version, token_hash,
-		       probe_addr::text, probe_port, capabilities, host_info,
+		       COALESCE(host(probe_addr), ''), probe_port, capabilities, host_info,
 		       registered_at, last_seen_at, disabled
 		FROM agents WHERE token_hash = $1`, hashToken(token)).
 		Scan(&a.AgentID, &a.Name, &a.Group, &a.Version, &stored,
@@ -234,9 +234,7 @@ func (s *Store) AuthenticateAgent(ctx context.Context, token string) (model.Agen
 	if a.Disabled {
 		return model.Agent{}, ErrBadToken
 	}
-	if probeAddr != nil {
-		a.ProbeAddr = *probeAddr
-	}
+	a.ProbeAddr = probeAddr
 	return a, nil
 }
 
@@ -253,7 +251,7 @@ func (s *Store) Heartbeat(ctx context.Context, id uuid.UUID) error {
 
 func (s *Store) ListAgents(ctx context.Context, group string) ([]model.Agent, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT agent_id, name, group_name, version, probe_addr::text, probe_port,
+		SELECT agent_id, name, group_name, version, COALESCE(host(probe_addr), ''), probe_port,
 		       capabilities, host_info, registered_at, last_seen_at, disabled
 		FROM agents
 		WHERE ($1 = '' OR group_name = $1)
@@ -266,15 +264,13 @@ func (s *Store) ListAgents(ctx context.Context, group string) ([]model.Agent, er
 	var out []model.Agent
 	for rows.Next() {
 		var a model.Agent
-		var probeAddr *string
+		var probeAddr string
 		if err := rows.Scan(&a.AgentID, &a.Name, &a.Group, &a.Version,
 			&probeAddr, &a.ProbePort, &a.Capabilities, &a.Host,
 			&a.RegisteredAt, &a.LastSeenAt, &a.Disabled); err != nil {
 			return nil, err
 		}
-		if probeAddr != nil {
-			a.ProbeAddr = *probeAddr
-		}
+		a.ProbeAddr = probeAddr
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -343,7 +339,7 @@ func (s *Store) fillPeers(ctx context.Context, peers map[uuid.UUID]*model.PeerRe
 		ids = append(ids, id)
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT agent_id, name, probe_addr::text, probe_port
+		SELECT agent_id, name, COALESCE(host(probe_addr), ''), probe_port
 		FROM agents WHERE agent_id = ANY($1)`, ids)
 	if err != nil {
 		return err
@@ -352,8 +348,7 @@ func (s *Store) fillPeers(ctx context.Context, peers map[uuid.UUID]*model.PeerRe
 
 	for rows.Next() {
 		var id uuid.UUID
-		var name string
-		var addr *string
+		var name, addr string
 		var port int
 		if err := rows.Scan(&id, &name, &addr, &port); err != nil {
 			return err
@@ -361,9 +356,7 @@ func (s *Store) fillPeers(ctx context.Context, peers map[uuid.UUID]*model.PeerRe
 		if ref, ok := peers[id]; ok {
 			ref.Name = name
 			ref.ProbePort = port
-			if addr != nil {
-				ref.Address = *addr
-			}
+			ref.Address = addr
 		}
 	}
 	return rows.Err()

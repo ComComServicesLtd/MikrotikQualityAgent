@@ -118,11 +118,16 @@ impl TaskDto {
             "reflector" => plan::Role::Reflector,
             other => return Err(ControllerError::Decode(format!("unknown role {other:?}"))),
         };
-        let session_id = u64::from_str_radix(self.session_id.trim_start_matches("0x"), 16)
-            .or_else(|_| self.session_id.parse::<u64>())
-            .map_err(|_| {
-                ControllerError::Decode(format!("bad session_id {:?}", self.session_id))
-            })?;
+        // Decimal first: the controller sends `json:",string"`, which is decimal,
+        // and every decimal string is also valid hex -- so trying hex first
+        // would silently mis-read "255" as 0x255 and target a session the
+        // reflector never granted. Only an explicit 0x prefix means hex.
+        let raw = self.session_id.trim();
+        let session_id = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => raw.parse::<u64>(),
+        }
+        .map_err(|_| ControllerError::Decode(format!("bad session_id {:?}", self.session_id)))?;
 
         Ok((
             plan::Task {
@@ -305,7 +310,7 @@ mod tests {
             ("path_trace", plan::Kind::PathTrace),
             ("wifi_signal", plan::Kind::WifiSignal),
         ] {
-            let (t, _) = dto(k, "sender", "cafe").into_plan().unwrap();
+            let (t, _) = dto(k, "sender", "51966").into_plan().unwrap();
             assert_eq!(t.kind, want, "kind {k}");
         }
     }
@@ -314,25 +319,36 @@ mod tests {
     fn an_unknown_kind_is_an_error_not_a_default() {
         // Guessing would run the wrong measurement and file it under the
         // controller's label for something else.
-        let err = dto("quantum_ping", "sender", "cafe").into_plan().unwrap_err();
+        let err = dto("quantum_ping", "sender", "1").into_plan().unwrap_err();
         assert!(matches!(err, ControllerError::Decode(_)));
         assert!(!err.is_retryable(), "a malformed task will not become valid on retry");
     }
 
     #[test]
     fn an_unknown_role_is_rejected() {
-        assert!(dto("mqp_probe", "bystander", "cafe").into_plan().is_err());
+        assert!(dto("mqp_probe", "bystander", "1").into_plan().is_err());
     }
 
     #[test]
     fn session_ids_survive_at_full_64_bit_width() {
-        // The reason session_id crosses the wire as a string at all.
-        let (t, _) = dto("mqp_probe", "sender", "ffffffffffffffff").into_plan().unwrap();
+        // The reason session_id crosses the wire as a string at all: as a JSON
+        // number this would be rounded by any f64-based parser.
+        let (t, _) = dto("mqp_probe", "sender", "18446744073709551615").into_plan().unwrap();
         assert_eq!(t.session_id, u64::MAX);
     }
 
     #[test]
-    fn session_ids_accept_a_hex_prefix() {
+    fn bare_digits_are_decimal_not_hex() {
+        // The controller sends Go's `json:",string"`, which is decimal. Every
+        // decimal string is also valid hex, so guessing hex first would read
+        // "255" as 597 and target a session the reflector never granted --
+        // silently, as 100% packet loss on a healthy path.
+        let (t, _) = dto("mqp_probe", "sender", "255").into_plan().unwrap();
+        assert_eq!(t.session_id, 255);
+    }
+
+    #[test]
+    fn an_explicit_prefix_still_selects_hex() {
         let (t, _) = dto("mqp_probe", "sender", "0xcafe").into_plan().unwrap();
         assert_eq!(t.session_id, 0xcafe);
     }
@@ -359,7 +375,7 @@ mod tests {
     fn unknown_response_fields_are_ignored() {
         // A newer controller must be able to add fields without breaking
         // agents already in the field, which cannot easily be upgraded.
-        let raw = r#"{"task_id":"t1","session_id":"cafe","kind":"mqp_probe",
+        let raw = r#"{"task_id":"t1","session_id":"51966","kind":"mqp_probe",
                       "role":"sender","brand_new_field":42}"#;
         let d: TaskDto = serde_json::from_str(raw).unwrap();
         assert_eq!(d.task_id, "t1");

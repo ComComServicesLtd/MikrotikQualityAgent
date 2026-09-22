@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS agents (
     capabilities  JSONB NOT NULL DEFAULT '{}'::jsonb,
     host_info     JSONB NOT NULL DEFAULT '{}'::jsonb,
 
+    -- Whether peers can open a session *to* this agent. An agent behind NAT
+    -- can complete a measurement as the sender -- the reflector's reply rides
+    -- the same UDP flow and conntrack carries it home -- but it cannot be
+    -- probed, so it must never be scheduled as a reflector.
+    inbound_reachable BOOLEAN NOT NULL DEFAULT true,
+    -- Designates a hub for the 'hub' mesh plan.
+    is_hub        BOOLEAN NOT NULL DEFAULT false,
+
     registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at  TIMESTAMPTZ,
     -- 'stale' is derived from last_seen_at rather than stored, except for
