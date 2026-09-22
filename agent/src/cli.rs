@@ -81,6 +81,84 @@ pub struct ProbeArgs {
     pub json: bool,
 }
 
+/// Build a standalone command from environment variables.
+///
+/// RouterOS parameterises containers through `/container/envs` envlists and
+/// does not reliably forward the `cmd` property into the container's argv — a
+/// container created with `cmd="reflect --session cafe"` starts with an empty
+/// argv and silently falls through to managed mode. Environment variables are
+/// the native and dependable mechanism on that platform, so the standalone
+/// modes accept them too.
+///
+/// Returns `None` when `MQ_MODE` is unset or names the managed agent.
+pub fn from_env<F>(get: F) -> Option<Result<Command, String>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mode = get("MQ_MODE")?.trim().to_ascii_lowercase();
+
+    let sess = |d: u64| -> Result<u64, String> {
+        match get("MQ_SESSION") {
+            Some(s) => u64::from_str_radix(s.trim().trim_start_matches("0x"), 16)
+                .map_err(|_| format!("MQ_SESSION {s:?} is not hexadecimal")),
+            None => Ok(d),
+        }
+    };
+    let port = || -> Result<u16, String> { num(get("MQ_PROBE_PORT").as_deref(), 5301, "MQ_PROBE_PORT") };
+    let dscp = || -> Result<Option<u8>, String> {
+        match get("MQ_DSCP") {
+            Some(d) if !d.trim().is_empty() => {
+                let v: u8 = d.trim().parse().map_err(|_| format!("MQ_DSCP {d:?} is not a number"))?;
+                if v > 63 {
+                    return Err(format!("MQ_DSCP {v} is out of range (0-63)"));
+                }
+                Ok(Some(v))
+            }
+            _ => Ok(None),
+        }
+    };
+
+    Some((|| match mode.as_str() {
+        "agent" => Ok(Command::Agent),
+        "reflect" => Ok(Command::Reflect(ReflectArgs {
+            port: port()?,
+            session: sess(1)?,
+            peer: match get("MQ_PEER_IP") {
+                Some(p) if !p.trim().is_empty() => {
+                    Some(p.trim().parse().map_err(|_| format!("MQ_PEER_IP {p:?} is not an IP"))?)
+                }
+                _ => None,
+            },
+        })),
+        "probe" => {
+            let peer = get("MQ_PEER").ok_or("MQ_MODE=probe requires MQ_PEER")?;
+            let peer = peer.trim();
+            let peer: SocketAddr = if peer.contains(':') {
+                peer.parse().map_err(|_| format!("MQ_PEER {peer:?} is not addr:port"))?
+            } else {
+                format!("{peer}:{}", port()?)
+                    .parse()
+                    .map_err(|_| format!("MQ_PEER {peer:?} is not an IP"))?
+            };
+            Ok(Command::Probe(Box::new(ProbeArgs {
+                peer,
+                session: sess(1)?,
+                count: num(get("MQ_COUNT").as_deref(), 100, "MQ_COUNT")?,
+                interval_ms: num(get("MQ_INTERVAL_MS").as_deref(), 20, "MQ_INTERVAL_MS")?,
+                size: num(get("MQ_SIZE").as_deref(), DEFAULT_PACKET_LEN, "MQ_SIZE")?,
+                dscp: dscp()?,
+                timeout_ms: num(get("MQ_TIMEOUT_MS").as_deref(), 1000, "MQ_TIMEOUT_MS")?,
+                codec: codec(get("MQ_CODEC").as_deref())?,
+                json: matches!(
+                    get("MQ_JSON").as_deref().map(str::trim),
+                    Some("1" | "true" | "yes" | "on")
+                ),
+            })))
+        }
+        other => Err(format!("MQ_MODE {other:?} is not one of: agent, reflect, probe")),
+    })())
+}
+
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
     let mut it = args.into_iter().skip(1).peekable();
 
@@ -328,6 +406,74 @@ mod tests {
     #[test]
     fn no_arguments_runs_the_managed_agent() {
         assert_eq!(parse(argv(&[])).unwrap(), Command::Agent);
+    }
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn unset_mq_mode_leaves_the_agent_in_managed_mode() {
+        assert!(from_env(env(&[])).is_none());
+    }
+
+    #[test]
+    fn env_can_select_reflect_mode() {
+        // The case that matters on RouterOS: `cmd` is not forwarded into argv,
+        // so without this the container silently falls through to managed mode
+        // and dies asking for MQ_CONTROLLER_URL.
+        let c = from_env(env(&[("MQ_MODE", "reflect"), ("MQ_SESSION", "cafe"), ("MQ_PROBE_PORT", "5301")]))
+            .unwrap()
+            .unwrap();
+        let Command::Reflect(r) = c else { panic!("expected reflect") };
+        assert_eq!(r.session, 0xcafe);
+        assert_eq!(r.port, 5301);
+        assert!(r.peer.is_none());
+    }
+
+    #[test]
+    fn env_can_select_probe_mode_with_a_bare_peer_ip() {
+        let c = from_env(env(&[
+            ("MQ_MODE", "probe"),
+            ("MQ_PEER", "172.16.220.138"),
+            ("MQ_SESSION", "cafe"),
+            ("MQ_COUNT", "300"),
+            ("MQ_DSCP", "46"),
+        ]))
+        .unwrap()
+        .unwrap();
+        let Command::Probe(p) = c else { panic!("expected probe") };
+        assert_eq!(p.peer, "172.16.220.138:5301".parse::<SocketAddr>().unwrap());
+        assert_eq!(p.count, 300);
+        assert_eq!(p.dscp, Some(46));
+        assert_eq!(p.session, 0xcafe);
+    }
+
+    #[test]
+    fn env_probe_without_a_peer_is_rejected() {
+        let err = from_env(env(&[("MQ_MODE", "probe")])).unwrap().unwrap_err();
+        assert!(err.contains("MQ_PEER"), "got {err}");
+    }
+
+    #[test]
+    fn env_rejects_an_unknown_mode_rather_than_defaulting() {
+        // Defaulting a typo'd MQ_MODE to managed mode would be a silent
+        // misconfiguration that only shows up as "no measurements".
+        let err = from_env(env(&[("MQ_MODE", "reflct")])).unwrap().unwrap_err();
+        assert!(err.contains("not one of"), "got {err}");
+    }
+
+    #[test]
+    fn env_mode_agent_is_explicit_and_valid() {
+        assert_eq!(from_env(env(&[("MQ_MODE", "agent")])).unwrap().unwrap(), Command::Agent);
+    }
+
+    #[test]
+    fn env_validates_dscp_range() {
+        let err = from_env(env(&[("MQ_MODE", "probe"), ("MQ_PEER", "10.0.0.1"), ("MQ_DSCP", "99")]))
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("out of range"), "got {err}");
     }
 
     #[test]

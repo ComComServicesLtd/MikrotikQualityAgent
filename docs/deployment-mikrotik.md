@@ -314,6 +314,73 @@ that starts and immediately dies with no useful message.
 
 ---
 
+## Lessons from a real deployment
+
+Verified on hAP ac³ / RouterOS 7.24.2. Each of these cost real debugging time.
+
+### `docker save` alone is not enough on Docker 28+
+
+Docker's containerd image store emits the **OCI layout** — `blobs/sha256/<digest>`
+with gzipped layers — even for `docker save` and
+`buildx --output=type=docker`. RouterOS only understands the **legacy** layout,
+`<layer-id>/layer.tar`, uncompressed. Importing an OCI archive fails with:
+
+```
+download/extract error: could not load next layer
+```
+
+which names neither the cause nor the fix. `make agent-image-armv7` now runs
+[`deploy/mikrotik/oci-to-docker-archive.py`](../deploy/mikrotik/oci-to-docker-archive.py)
+and emits a `-ros.tar` — **import that one.** The script verifies each
+decompressed layer against the config's `diff_id`, so a silent corruption
+becomes a build failure rather than a container that will not start.
+
+### RouterOS does not pass `cmd` into the container's argv
+
+A container created with `cmd="reflect --session cafe"` logs
+
+```
+*** started /mqagent reflect --session cafe --port 5301
+```
+
+and then starts the binary with an **empty argv**. The agent therefore selects
+its mode from `MQ_MODE` as well as from the command line — envlists are the
+mechanism RouterOS actually delivers.
+
+### The REST property is `envlists`, not `envlist`
+
+The CLI spells it `envlist=`; REST rejects that with
+`unknown parameter envlist`. Also, `root-dir` wants a leading slash.
+
+### dst-nat rule order decides everything
+
+Rules are evaluated top to bottom and **the first match wins**. A new rule for a
+port some earlier rule already claims will sit at the bottom matching nothing:
+
+```
+*3 dst-nat udp dport=5301 -> 172.30.1.2:5301   "lab: testhost w24"   pkts=11
+*8 dst-nat udp dport=5301 -> 172.30.2.2:5301   "ours"                pkts=0
+```
+
+Check with `/ip/firewall/nat/print stats` before assuming the container is at
+fault — a reflector that is running perfectly looks identical to a dead one when
+its traffic is being redirected somewhere else. Pick a free port rather than
+reordering someone else's rules.
+
+### Agents behind NAT must be senders, not reflectors
+
+A NAT'd agent can complete a full measurement because the reflector's reply
+rides the same UDP flow and conntrack carries it home. It cannot be *probed*
+without an inbound forward. The scheduler must therefore always cast a NAT'd
+agent as the sender. Measured across such a boundary:
+
+```
+Loss  5/300 lost (1.67%)  [forward 0 · reverse 5]
+```
+
+All five losses were on the return path — the expected signature of UDP
+conntrack eviction, and the directional split is what makes it legible.
+
 ## Troubleshooting
 
 | Symptom | Cause |

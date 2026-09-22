@@ -17,13 +17,28 @@ use mqagent::config::Config;
 use mqagent::probe::reflector::{Reflector, Registry};
 
 fn main() -> ExitCode {
-    let command = match cli::parse(std::env::args()) {
+    let parsed = match cli::parse(std::env::args()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}\n");
             eprintln!("{}", cli::USAGE);
             return ExitCode::from(2);
         }
+    };
+
+    // No sub-command on the command line: consult MQ_MODE. RouterOS does not
+    // reliably forward a container's `cmd` into argv, so on that platform the
+    // environment is the only dependable way to select a mode.
+    let command = match parsed {
+        cli::Command::Agent => match cli::from_env(|k| std::env::var(k).ok()) {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+            None => cli::Command::Agent,
+        },
+        other => other,
     };
 
     match command {

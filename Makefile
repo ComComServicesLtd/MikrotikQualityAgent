@@ -33,7 +33,11 @@ agent-image-armv7: | $(DIST) ## Build armv7 image and export a RouterOS-importab
 	    --build-arg TARGET=armv7-unknown-linux-musleabihf \
 	    -t mqagent:$(AGENT_VERSION)-armv7 agent/
 	docker save mqagent:$(AGENT_VERSION)-armv7 -o $(DIST)/mqagent-$(AGENT_VERSION)-armv7.tar
-	@echo "-> $(DIST)/mqagent-$(AGENT_VERSION)-armv7.tar ($$(du -h $(DIST)/mqagent-$(AGENT_VERSION)-armv7.tar | cut -f1))"
+	python3 deploy/mikrotik/oci-to-docker-archive.py \
+	    $(DIST)/mqagent-$(AGENT_VERSION)-armv7.tar \
+	    $(DIST)/mqagent-$(AGENT_VERSION)-armv7-ros.tar \
+	    mqagent:$(AGENT_VERSION)-armv7
+	@echo "-> import this one onto RouterOS: $(DIST)/mqagent-$(AGENT_VERSION)-armv7-ros.tar"
 
 .PHONY: agent-image-arm64
 agent-image-arm64: | $(DIST) ## Build arm64 image and export a RouterOS-importable tar
