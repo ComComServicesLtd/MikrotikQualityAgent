@@ -29,6 +29,7 @@ $(DIST):
 .PHONY: agent-image-armv7
 agent-image-armv7: | $(DIST) ## Build armv7 image and export a RouterOS-importable tar
 	docker buildx build --platform linux/arm/v7 --output=type=docker \
+	    --provenance=false --sbom=false \
 	    --build-arg TARGET=armv7-unknown-linux-musleabihf \
 	    -t mqagent:$(AGENT_VERSION)-armv7 agent/
 	docker save mqagent:$(AGENT_VERSION)-armv7 -o $(DIST)/mqagent-$(AGENT_VERSION)-armv7.tar
@@ -37,6 +38,7 @@ agent-image-armv7: | $(DIST) ## Build armv7 image and export a RouterOS-importab
 .PHONY: agent-image-arm64
 agent-image-arm64: | $(DIST) ## Build arm64 image and export a RouterOS-importable tar
 	docker buildx build --platform linux/arm64 --output=type=docker \
+	    --provenance=false --sbom=false \
 	    --build-arg TARGET=aarch64-unknown-linux-musl \
 	    -t mqagent:$(AGENT_VERSION)-arm64 agent/
 	docker save mqagent:$(AGENT_VERSION)-arm64 -o $(DIST)/mqagent-$(AGENT_VERSION)-arm64.tar

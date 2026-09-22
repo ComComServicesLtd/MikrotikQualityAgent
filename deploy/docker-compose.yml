@@ -1,0 +1,56 @@
+# Local development stack: controller + TimescaleDB.
+#
+# Agents run on real MikroTik hardware during development and reach this over
+# the LAN, so the controller binds all interfaces rather than loopback. Find
+# the address agents should use with `ip addr` and set MQ_CONTROLLER_URL on
+# each router accordingly.
+
+name: mikrotik-quality
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: mqagent
+      POSTGRES_USER: mqagent
+      # Dev-only credential. The controller reaches the database over the
+      # compose network, which is not published outside the host.
+      POSTGRES_PASSWORD: mqagent-dev
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mqagent -d mqagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Not published: nothing outside the compose network needs the database,
+    # and exposing Postgres on the LAN during development is how test data
+    # becomes an incident. Use `docker compose exec db psql -U mqagent` instead.
+    expose:
+      - "5432"
+
+  controller:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MQ_DATABASE_URL: postgres://mqagent:mqagent-dev@db:5432/mqagent?sslmode=disable
+      MQ_LISTEN_ADDR: ":8080"
+      MQ_LOG: info
+      # Set this to enable the operator endpoints. Left unset, they return 403.
+      MQ_OPERATOR_TOKEN: ${MQ_OPERATOR_TOKEN:-}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/controller", "-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  db-data:

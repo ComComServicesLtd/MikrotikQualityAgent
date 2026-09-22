@@ -81,9 +81,16 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Probe sender / reflector | Implemented, tested |
 | Statistics (RTT, jitter, loss, reorder, DSCP) | Implemented, tested |
 | MOS / R-factor | Implemented, tested |
-| Config | Implemented, tested |
-| armv7 / arm64 container image | Implemented |
-| Controller REST API | Contract specified; implementation in progress |
-| Agent controller client | Not yet implemented — agent runs reflector-only |
-| RouterOS bandwidth-test offload | Not yet implemented |
-| TWAMP-Light interop | Not yet implemented |
+| Agent config | Implemented, tested |
+| armv7 / arm64 container image | Implemented — 880 KB static binary, 488 KB tar |
+| Controller: schema, agent endpoints, auth | Implemented |
+| Controller: mesh scheduler | Not yet — no tasks are generated, so agents lease nothing |
+| Agent controller client | Not yet — agent runs reflector-only |
+| RouterOS bandwidth-test offload | Not yet |
+| TWAMP-Light interop | Not yet |
+
+The two gaps that matter for an end-to-end run are the **mesh scheduler** (the
+controller stores and hands out tasks, but nothing creates them yet) and the
+**agent's controller client** (the agent reflects for peers but does not
+register or poll). Until both land, the agent is usable only as a reflector
+driven by a sender you invoke directly.
