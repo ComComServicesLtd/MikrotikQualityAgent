@@ -36,6 +36,8 @@ USAGE:
     mqagent scan     [OPTIONS]     IP-scan a range from a RouterOS device
     mqagent twamp-reflect [OPTIONS]  TWAMP-Light responder (RouterOS has none)
     mqagent twamp-probe   [OPTIONS]  Measure against any TWAMP-Light responder
+    mqagent btest    [OPTIONS]     Throughput test via the router's own hardware
+    mqagent capture  [OPTIONS]     Packet or 802.11 capture, to name a talker
     mqagent --help
 
 REFLECT OPTIONS:
@@ -96,8 +98,27 @@ TWAMP-PROBE OPTIONS:
 EXAMPLE — find where the latency is introduced:
     mqagent trace --host 172.16.220.1 --user claude --target 1.1.1.1
 
+BTEST OPTIONS:   (plus the RouterOS options above)
+    --target <IP>        Far end, running /tool/bandwidth-server   [required]
+    --direction <DIR>    rx | tx | both                            [default: rx]
+    --protocol <PROTO>   tcp | udp                                 [default: tcp]
+    --duration <S>       Seconds, capped at 45 by the REST limit   [default: 10]
+    --bt-user <NAME>     User on the FAR router, needs `test` policy
+    --bt-pass <SECRET>   Its password
+    --connections <N>    TCP streams
+    --limit <BPS>        Cap the offered rate, to spare a live link
+
+CAPTURE OPTIONS: (plus the RouterOS options above)
+    --interface <NAME>   Capture here; omit for all interfaces
+    --duration <S>       Seconds, capped at 60                     [default: 10]
+    --wireless           Capture 802.11 frames (legacy wireless stack only)
+    --hop                Hop channels during a wireless capture — disruptive
+
 EXAMPLE — let a MikroTik answer TWAMP, which RouterOS cannot do itself:
     mqagent twamp-reflect --port 862 --peer 203.0.113.7
+
+EXAMPLE — find which host is flooding a LAN:
+    mqagent capture --host 172.16.220.1 --user claude --duration 15
 ";
 
 #[derive(Debug, PartialEq)]
@@ -111,6 +132,33 @@ pub enum Command {
     Scan(Box<ScanArgs>),
     TwampReflect(TwampReflectArgs),
     TwampProbe(Box<TwampProbeArgs>),
+    Btest(Box<BtestArgs>),
+    Capture(Box<CaptureArgs>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct BtestArgs {
+    pub ros: DiscoverArgs,
+    pub target: String,
+    pub direction: crate::routeros::btest::Direction,
+    pub protocol: crate::routeros::btest::Protocol,
+    pub duration_s: u64,
+    pub bt_user: String,
+    pub bt_pass: String,
+    pub connections: Option<u32>,
+    pub limit_bps: Option<u64>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CaptureArgs {
+    pub ros: DiscoverArgs,
+    pub interface: String,
+    pub duration_s: u64,
+    /// Capture 802.11 frames instead of IP traffic. Legacy wireless stack only.
+    pub wireless: bool,
+    /// Hop channels during a wireless capture. Sees neighbours, but leaves our
+    /// own channel repeatedly and so interrupts associated clients.
+    pub hop: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -317,7 +365,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
         let Some(key) = tok.strip_prefix("--") else {
             return Err(format!("unexpected argument {tok:?}"));
         };
-        if key == "json" || key == "tls" {
+        if matches!(key, "json" | "tls" | "wireless" | "hop") {
             flags.push(key.to_string());
             continue;
         }
@@ -422,6 +470,39 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 timeout_ms: num(get("timeout"), 1000, "timeout")?,
                 codec: codec(get("codec"))?,
                 json: flags.iter().any(|f| f == "json"),
+            })))
+        }
+        "btest" => {
+            use crate::routeros::btest::{Direction, Protocol};
+            let ros = ros_args(&get, &flags)?;
+            Ok(Command::Btest(Box::new(BtestArgs {
+                target: get("target").ok_or("btest requires --target")?.to_string(),
+                direction: Direction::parse(get("direction").unwrap_or("rx"))
+                    .ok_or("--direction must be rx, tx or both")?,
+                protocol: Protocol::parse(get("protocol").unwrap_or("tcp"))
+                    .ok_or("--protocol must be tcp or udp")?,
+                duration_s: num(get("duration"), 10, "duration")?,
+                bt_user: get("bt-user").unwrap_or("").to_string(),
+                bt_pass: get("bt-pass").unwrap_or("").to_string(),
+                connections: match get("connections") {
+                    Some(v) => Some(v.parse().map_err(|_| "--connections is not a number")?),
+                    None => None,
+                },
+                limit_bps: match get("limit") {
+                    Some(v) => Some(v.parse().map_err(|_| "--limit is not a number")?),
+                    None => None,
+                },
+                ros,
+            })))
+        }
+        "capture" => {
+            let ros = ros_args(&get, &flags)?;
+            Ok(Command::Capture(Box::new(CaptureArgs {
+                interface: get("interface").unwrap_or("").to_string(),
+                duration_s: num(get("duration"), 10, "duration")?,
+                wireless: flags.iter().any(|f| f == "wireless"),
+                hop: flags.iter().any(|f| f == "hop"),
+                ros,
             })))
         }
         "trace" => {
@@ -1256,5 +1337,160 @@ pub async fn run_twamp_probe(args: TwampProbeArgs) -> anyhow::Result<()> {
     if m.loss.received == 0 {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Throughput test driven by the router's own hardware.
+pub async fn run_btest(args: BtestArgs) -> anyhow::Result<()> {
+    use crate::routeros::btest::{self, BtestConfig, CpuVerdict};
+
+    let ros = connect(&args.ros)?;
+    let identity = ros.check().await?;
+    if !args.ros.json {
+        eprintln!(
+            "bandwidth test from {} ({}) to {} — {:?} {:?}, {}s",
+            identity, args.ros.host, args.target, args.protocol, args.direction, args.duration_s
+        );
+    }
+
+    let mut cfg = BtestConfig::new(args.target.clone(), args.direction, args.protocol);
+    cfg.duration = Duration::from_secs(args.duration_s);
+    cfg.user = args.bt_user;
+    cfg.password = args.bt_pass;
+    cfg.connection_count = args.connections;
+    cfg.local_tx_speed = args.limit_bps;
+    cfg.remote_tx_speed = args.limit_bps;
+
+    let r = btest::run(&ros, &cfg).await?;
+
+    if args.ros.json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+
+    let mbps = |v: Option<u64>| v.map(|b| format!("{:.1} Mbit/s", b as f64 / 1e6));
+    println!();
+    if let Some(v) = mbps(r.rx_bps) {
+        println!("  download (rx)  {v}");
+    }
+    if let Some(v) = mbps(r.tx_bps) {
+        println!("  upload   (tx)  {v}");
+    }
+    println!("  duration       {}s", r.duration_s);
+    if let Some(c) = r.local_cpu_load {
+        print!("  CPU            local {c}%");
+        match r.remote_cpu_load {
+            Some(rc) => println!(", remote {rc}%"),
+            None => println!(),
+        }
+    }
+    if let Some(l) = r.lost_packets {
+        println!("  lost packets   {l}");
+    }
+    if let Some(n) = r.connection_count {
+        println!("  connections    {n}");
+    }
+    println!("  measured by    {}", r.source);
+
+    // The verdict is the part that stops a CPU-bound number being read as a
+    // link speed.
+    let verdict = match r.cpu_verdict {
+        CpuVerdict::LinkLimited => "link-limited — the router had headroom",
+        CpuVerdict::RouterContributing => "router contributed to the ceiling",
+        CpuVerdict::RouterLimited => "ROUTER-LIMITED — this measures the router, not the link",
+    };
+    println!("  verdict        {verdict}");
+
+    for n in &r.notes {
+        println!("\n  note: {n}");
+    }
+    Ok(())
+}
+
+/// Capture traffic and name the host behind it.
+pub async fn run_capture(args: CaptureArgs) -> anyhow::Result<()> {
+    use crate::discovery::capture;
+
+    let ros = connect(&args.ros)?;
+    let identity = ros.check().await?;
+    let d = Duration::from_secs(args.duration_s);
+
+    if !args.ros.json {
+        eprintln!(
+            "capturing {} on {} for {}s{}",
+            if args.wireless { "802.11 frames" } else { "IP traffic" },
+            identity,
+            args.duration_s,
+            if args.interface.is_empty() { String::new() } else { format!(" ({})", args.interface) }
+        );
+        if args.wireless {
+            eprintln!("NOTE: monitor mode interrupts service for associated clients");
+        }
+    }
+
+    let cap = if args.wireless {
+        capture::run_wireless_capture(&ros, &args.interface, d, args.hop).await?
+    } else {
+        capture::run_packet_capture(&ros, &args.interface, d).await?
+    };
+    let found = capture::analyse(&cap);
+
+    if args.ros.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "router": identity, "capture": cap, "findings": found,
+        }))?);
+        return Ok(());
+    }
+
+    println!();
+    if cap.used_wireless_sniffer {
+        println!(
+            "{} 802.11 frames captured on {} in {}s",
+            cap.wireless_frames, cap.interface, cap.duration_s
+        );
+        let crc = cap.frames.iter().filter(|f| f.crc_error).count();
+        if !cap.frames.is_empty() {
+            println!("  channel        {}", cap.frames[0].channel);
+            println!("  CRC failures   {crc} of {}", cap.frames.len());
+        }
+        let mut by_src: std::collections::BTreeMap<&str, usize> = Default::default();
+        for f in &cap.frames {
+            if !f.src.is_empty() {
+                *by_src.entry(f.src.as_str()).or_default() += 1;
+            }
+        }
+        let mut t: Vec<_> = by_src.into_iter().collect();
+        t.sort_by(|a, b| b.1.cmp(&a.1));
+        if !t.is_empty() {
+            println!("\n  transmitters (by frame count)");
+            for (src, n) in t.iter().take(8) {
+                let sig: Vec<i32> = cap.frames.iter()
+                    .filter(|f| f.src == *src).map(|f| f.signal_dbm).collect();
+                let avg = if sig.is_empty() { 0 } else { sig.iter().sum::<i32>() / sig.len() as i32 };
+                println!("    {src}  {n:>5} frames  avg {avg} dBm");
+            }
+        }
+    } else {
+        println!("{} hosts seen in {}s — busiest first", cap.hosts.len(), cap.duration_s);
+        for h in cap.hosts.iter().take(12) {
+            println!(
+                "  {:<40} tx {:>10} B/s   rx {:>10} B/s",
+                h.address, h.tx_rate_bps, h.rx_rate_bps
+            );
+        }
+        if !cap.protocols.is_empty() {
+            println!("\nprotocols");
+            for p in cap.protocols.iter().take(6) {
+                println!(
+                    "  {:<16} {:>12} bytes  {:>6.1}%  ({} packets)",
+                    p.protocol, p.bytes, p.share_pct, p.packets
+                );
+            }
+        }
+    }
+    for n in &cap.notes {
+        println!("\n  note: {n}");
+    }
+    print_findings(&found);
     Ok(())
 }

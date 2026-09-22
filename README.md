@@ -129,6 +129,32 @@ identifier** — the source allow-list is the only admission control, so firewal
 the port. It also carries no DSCP echo, so QoS conformance is unavailable over
 TWAMP; that gap is why MQP exists.
 
+### Throughput and capture
+
+Throughput runs on the router's own forwarding hardware, not in the container:
+
+```bash
+mqagent btest --host 172.16.220.1 --user claude \
+    --target 10.0.0.2 --direction rx --protocol tcp --duration 10
+```
+
+Every result carries a CPU verdict. On small MikroTik hardware the router is
+very often the limit rather than the link, and 621 Mbit/s at 64% CPU means
+something quite different from the same figure at 8%.
+
+Capture names the host behind a problem, which interface counters cannot:
+
+```bash
+mqagent capture --host 172.16.220.1 --user claude --duration 15
+mqagent capture --host 172.16.220.1 --user claude --wireless --duration 10
+```
+
+`--wireless` drives `/interface/wireless/sniffer` for 802.11 frames — beacons,
+acks, probe requests, CRC failures, and the rate each frame was sent at. That
+layer is invisible to a packet capture. It exists only on the legacy `wireless`
+stack; on ax-generation boards the command degrades to a packet capture and
+says so.
+
 ### Network discovery
 
 The agent can survey a RouterOS device and explain what is wrong with the local
@@ -185,9 +211,9 @@ echo through actual `recvmsg` control messages — no mocking of the data plane.
 | Agent controller client + cached plan | Implemented, verified end to end |
 | Offline result spool | Implemented, tested |
 | Network discovery (wifi, ARP, DHCP, storms) | Implemented, verified against a live router |
-| RouterOS bandwidth-test offload | Not yet |
+| RouterOS bandwidth-test offload | Implemented — tcp/udp, rx/tx/both, with a CPU verdict |
 | Discovery: traceroute + ip-scan | Implemented, verified against a live router |
-| Discovery: pcap / broadcast-source attribution | Not yet — storms detected by counters only |
+| Discovery: packet + 802.11 capture | Implemented — names the host, not just the interface |
 | Operator API (groups, tokens, agents, membership, queries) | Implemented, tested |
 | Many-to-many group membership with roles | Implemented, verified with a shared upstream agent |
 | Dashboard (embedded + standalone) | Implemented, verified with live data |

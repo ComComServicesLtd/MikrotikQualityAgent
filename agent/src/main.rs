@@ -57,6 +57,8 @@ fn main() -> ExitCode {
         cli::Command::Scan(args) => standalone(cli::run_scan(*args)),
         cli::Command::TwampReflect(args) => standalone(cli::run_twamp_reflect(args)),
         cli::Command::TwampProbe(args) => standalone(cli::run_twamp_probe(*args)),
+        cli::Command::Btest(args) => standalone(cli::run_btest(*args)),
+        cli::Command::Capture(args) => standalone(cli::run_capture(*args)),
         cli::Command::Agent => run_managed(),
     }
 }

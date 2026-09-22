@@ -5,6 +5,7 @@
 //! Collectors gather raw RouterOS state; [`findings`] turns it into a short,
 //! ranked list of things that are actually wrong.
 
+pub mod capture;
 pub mod collect;
 pub mod findings;
 pub mod tools;

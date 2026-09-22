@@ -8,6 +8,8 @@
 //! Self-signed certificates are the norm on RouterOS, so TLS verification is
 //! optional and off by default — the connection does not leave the device.
 
+pub mod btest;
+
 use std::time::Duration;
 
 use serde_json::Value;
